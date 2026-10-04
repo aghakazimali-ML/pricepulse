@@ -1,7 +1,8 @@
 name: build-demo-db
 
-# Builds data/demo.db (full live scrape + 5 simulated days) for the Streamlit Cloud demo
-# and commits it to the branch. Runs automatically on a push when the file is missing,
+# Builds data/demo.db (full live scrape + 5 simulated days) for the Streamlit demo, exports
+# web/public/data.json for the Vercel dashboard, and commits both to the branch.
+# Runs automatically on a push when the file is missing,
 # or manually from the Actions tab to refresh it.
 on:
   push:
@@ -53,12 +54,13 @@ jobs:
           python cli.py simulate-price-changes --runs 5 --seed 42
           python cli.py quality-report --last
           python -c "import sqlite3; c = sqlite3.connect('data/demo.db'); c.execute('PRAGMA wal_checkpoint(TRUNCATE)'); c.execute('PRAGMA journal_mode=DELETE'); c.execute('VACUUM'); c.close()"
+          python scripts/export_static.py --db sqlite:///data/demo.db
 
-      - name: Commit demo.db
+      - name: Commit demo.db and the static dashboard data
         if: steps.check.outputs.skip == 'false'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -f data/demo.db
-          git commit -m "data: rebuild demo.db for the Streamlit demo" || echo "No changes"
+          git add -f data/demo.db web/public/data.json
+          git commit -m "data: rebuild demo.db and web data" || echo "No changes"
           git push
