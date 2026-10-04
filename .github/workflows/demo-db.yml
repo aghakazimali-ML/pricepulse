@@ -1,0 +1,64 @@
+name: build-demo-db
+
+# Builds data/demo.db (full live scrape + 5 simulated days) for the Streamlit Cloud demo
+# and commits it to the branch. Runs automatically on a push when the file is missing,
+# or manually from the Actions tab to refresh it.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: demo-db
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Skip if demo.db already exists (push events only)
+        id: check
+        run: |
+          if [ "${{ github.event_name }}" = "push" ] && [ -f data/demo.db ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/setup-python@v5
+        if: steps.check.outputs.skip == 'false'
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies and Chromium
+        if: steps.check.outputs.skip == 'false'
+        run: |
+          pip install -r requirements.txt
+          python -m playwright install --with-deps chromium
+
+      - name: Scrape everything and simulate 5 days of price changes
+        if: steps.check.outputs.skip == 'false'
+        env:
+          DATABASE_URL: sqlite:///data/demo.db
+        run: |
+          rm -f data/demo.db
+          python cli.py run --all
+          python cli.py simulate-price-changes --runs 5 --seed 42
+          python cli.py quality-report --last
+          python -c "import sqlite3; c = sqlite3.connect('data/demo.db'); c.execute('PRAGMA wal_checkpoint(TRUNCATE)'); c.execute('PRAGMA journal_mode=DELETE'); c.execute('VACUUM'); c.close()"
+
+      - name: Commit demo.db
+        if: steps.check.outputs.skip == 'false'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -f data/demo.db
+          git commit -m "data: rebuild demo.db for the Streamlit demo" || echo "No changes"
+          git push

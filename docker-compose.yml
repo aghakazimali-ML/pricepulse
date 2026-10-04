@@ -1,0 +1,52 @@
+# Postgres warehouse + one-shot pipeline + Streamlit dashboard.
+#   docker compose up --build        -> http://localhost:8501
+#   docker compose run --rm pipeline python cli.py run --source books --limit-pages 3
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: pricepulse
+      POSTGRES_PASSWORD: pricepulse
+      POSTGRES_DB: pricepulse
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pricepulse -d pricepulse"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  pipeline:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+psycopg2://pricepulse:pricepulse@postgres:5432/pricepulse
+    volumes:
+      - ./data/raw:/app/data/raw
+      - ./data/rejected:/app/data/rejected
+      - ./logs:/app/logs
+    # Initialise, scrape every source, then add demo price history.
+    command: >
+      sh -c "python cli.py init-db &&
+             python cli.py run --all;
+             python cli.py simulate-price-changes --runs 3 &&
+             python cli.py quality-report --last"
+
+  dashboard:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+psycopg2://pricepulse:pricepulse@postgres:5432/pricepulse
+    ports:
+      - "8501:8501"
+    command: ["streamlit", "run", "dashboard/Home.py", "--server.port=8501", "--server.address=0.0.0.0"]
+
+volumes:
+  pgdata:

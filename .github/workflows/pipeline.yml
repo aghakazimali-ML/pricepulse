@@ -1,0 +1,90 @@
+name: daily-pipeline
+
+on:
+  schedule:
+    - cron: "0 6 * * *"   # every day at 06:00 UTC
+  workflow_dispatch:
+    inputs:
+      limit_pages:
+        description: "Limit catalogue pages (blank = all 50)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write   # needed to push the database to the `data` branch
+
+concurrency:
+  group: daily-pipeline
+  cancel-in-progress: false
+
+env:
+  DATABASE_URL: sqlite:///data/pricepulse.db
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies and Chromium
+        run: |
+          pip install -r requirements.txt
+          python -m playwright install --with-deps chromium
+
+      # History only works if each run starts from yesterday's database.
+      - name: Restore previous database from the data branch
+        run: |
+          if git ls-remote --exit-code --heads origin data > /dev/null; then
+            git fetch --depth 1 origin data
+            git show origin/data:pricepulse.db > data/pricepulse.db && echo "Restored previous DB"
+          else
+            echo "No data branch yet, starting fresh"
+          fi
+
+      - name: Run pipeline
+        run: |
+          python cli.py init-db
+          if [ -n "${{ github.event.inputs.limit_pages }}" ]; then
+            python cli.py run --all --limit-pages "${{ github.event.inputs.limit_pages }}"
+          else
+            python cli.py run --all
+          fi
+
+      - name: Data-quality report
+        if: always()
+        run: python cli.py quality-report --last
+
+      # Option A: download the DB from the run's Artifacts tab (kept 30 days).
+      - name: Upload database artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pricepulse-db-${{ github.run_number }}
+          path: |
+            data/pricepulse.db
+            logs/
+            data/rejected/
+          retention-days: 30
+          if-no-files-found: warn
+
+      # Option B: keep the latest DB on an orphan `data` branch (also used for the restore step above).
+      - name: Commit database to the data branch
+        if: success()
+        run: |
+          python -c "import sqlite3; c = sqlite3.connect('data/pricepulse.db'); c.execute('PRAGMA wal_checkpoint(TRUNCATE)'); c.execute('PRAGMA journal_mode=DELETE'); c.close()"
+          cp data/pricepulse.db /tmp/pricepulse.db
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout --orphan data-tmp
+          git rm -rf --cached . > /dev/null
+          find . -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
+          cp /tmp/pricepulse.db pricepulse.db
+          git add pricepulse.db
+          git commit -m "data: pipeline run ${{ github.run_number }} ($(date -u +%Y-%m-%dT%H:%MZ))"
+          git push --force origin data-tmp:data
