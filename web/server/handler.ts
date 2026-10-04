@@ -17,7 +17,7 @@ export default async function handler(req: IncomingMessage, res: ServerResponse)
   if (rateLimited(ip)) return send(429, { error: "Too many requests. Try again in a minute." });
   const mode = (["auto", "html", "json"].includes(params.get("mode") ?? "") ? params.get("mode") : "auto") as ScrapeOptions["mode"];
   try {
-    send(200, await scrape(url, { mode, selector: params.get("selector") ?? undefined, allowPrivate: process.env.SCRAPE_ALLOW_PRIVATE === "1" }));
+    send(200, await scrape(url, { mode, selector: params.get("selector") ?? undefined, pages: Number(params.get("pages") ?? 1) || 1, allowPrivate: process.env.SCRAPE_ALLOW_PRIVATE === "1" }));
   } catch (e) {
     const err = e instanceof ScrapeError ? e : new ScrapeError("Something went wrong while scraping.", 500);
     if (!(e instanceof ScrapeError)) console.error(e);

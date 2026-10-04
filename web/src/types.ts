@@ -2,11 +2,21 @@ export interface Product {
   product_id: number;
   title: string;
   category: string;
-  price: number;
-  in_stock: boolean;
+  price: number | null;
+  in_stock: boolean | null;
   stock_qty: number | null;
-  rating: number;
+  rating: number | null;
   url: string;
+  extra?: Record<string, string | number | boolean | null>;
+}
+
+export interface Source {
+  id: string;
+  label: string;
+  url: string;
+  live: boolean;
+  currency: string;
+  columns: string[];
 }
 
 export interface Category {
@@ -47,6 +57,7 @@ export interface Run {
 
 export interface Data {
   generated_at: string;
+  source: Source;
   products: Product[];
   categories: Category[];
   price_index: { t: string; avg_price: number; pct_in_stock: number; products: number }[];

@@ -15,12 +15,13 @@ export interface ScrapeResult {
   contentType: string;
   kind: "html" | "json";
   bytes: number;
+  pages: number;
   ms: number;
   robots: "allowed" | "disallowed" | "not found" | "skipped";
   meta: Record<string, string | number>;
   datasets: Dataset[];
 }
-export interface ScrapeOptions { mode?: "auto" | "html" | "json"; selector?: string; allowPrivate?: boolean }
+export interface ScrapeOptions { mode?: "auto" | "html" | "json"; selector?: string; pages?: number; allowPrivate?: boolean }
 
 export class ScrapeError extends Error {
   constructor(message: string, public status = 400) { super(message); }
@@ -171,7 +172,8 @@ function fields(el: HTMLElement, base: URL): Record<string, Cell> {
   const img = el.querySelector("img");
   const titled = el.querySelector("[title]");
   const title = titled?.getAttribute("title") || text(heading) || img?.getAttribute("alt") || text(link) || text(el).slice(0, 120);
-  const priceMatch = text(el).match(PRICE);
+  const full = (el.structuredText ?? el.text).replace(/\s+/g, " ");
+  const priceMatch = full.match(PRICE);
   const ratingEl = el.querySelector("[class*=star], [class*=rating]");
   const ratingWord = (ratingEl?.getAttribute("class") ?? "").toLowerCase().split(/\s+/).find((c) => c in RATING_WORDS);
   const ratingText = ratingEl ? (ratingEl.getAttribute("aria-label") || ratingEl.getAttribute("title") || text(ratingEl)) : "";
@@ -179,7 +181,7 @@ function fields(el: HTMLElement, base: URL): Record<string, Cell> {
   if (priceMatch) { row.price_text = priceMatch[0]; row.price = num(priceMatch[0]); }
   if (ratingWord) row.rating = RATING_WORDS[ratingWord];
   else if (ratingText && num(ratingText) !== null) row.rating = num(ratingText);
-  const stock = text(el).match(/\b(in stock|out of stock|sold out|available)\b/i);
+  const stock = full.match(/(out of stock|sold out|unavailable|in stock|available)/i);
   if (stock) row.availability = stock[0];
   if (link) row.link = abs(link.getAttribute("href"), base);
   if (img) row.image = abs(img.getAttribute("src") || img.getAttribute("data-src"), base);
@@ -288,6 +290,43 @@ export function extractHtml(html: string, base: URL, selector?: string): { meta:
   return { meta, datasets };
 }
 
+/* The "next page" link of a paginated listing, if there is one. */
+export function nextLink(html: string, base: URL): URL | null {
+  const root = parse(html, { comment: false });
+  const rel = root.querySelector('link[rel="next"]') ?? root.querySelector('a[rel="next"]');
+  const candidates = rel ? [rel] : root.querySelectorAll("a[href]").filter((a) => {
+    const cls = `${a.getAttribute("class") ?? ""} ${(a.parentNode as HTMLElement | null)?.getAttribute?.("class") ?? ""}`;
+    const label = `${text(a)} ${a.getAttribute("aria-label") ?? ""} ${a.getAttribute("title") ?? ""}`.trim();
+    return /(^|\s)next(\s|$)/i.test(cls) || /^(next|next page|older|more)\b|^[›»→]$/i.test(label) || /\bnext\b/i.test(a.getAttribute("rel") ?? "");
+  });
+  for (const el of candidates) {
+    const href = el.getAttribute("href");
+    if (!href || href.startsWith("#") || /^javascript:/i.test(href)) continue;
+    try {
+      const u = new URL(href, base);
+      if (u.host === base.host && u.toString() !== base.toString()) return u;
+    } catch { /* skip bad hrefs */ }
+  }
+  return null;
+}
+
+/* Concatenate same-named datasets from several pages (links are de-duplicated). */
+function merge(all: Dataset[][]): Dataset[] {
+  const out: Dataset[] = [];
+  for (const sets of all) for (const d of sets) {
+    const prev = out.find((o) => o.name === d.name);
+    if (!prev) { out.push({ ...d, rows: [...d.rows] }); continue; }
+    d.columns.forEach((c) => { if (!prev.columns.includes(c)) prev.columns.push(c); });
+    const seen = new Set(prev.rows.map((r) => JSON.stringify(r)));
+    for (const r of d.rows) if (prev.rows.length < MAX_ROWS * 2 && !seen.has(JSON.stringify(r))) prev.rows.push(r);
+  }
+  for (const d of out) {
+    const n = d.rows.length;
+    d.description = d.description.replace(/^\d+/, String(n));
+  }
+  return out;
+}
+
 /* ----------------------------------------------------------------- api -- */
 
 export async function scrape(raw: string, opts: ScrapeOptions = {}): Promise<ScrapeResult> {
@@ -309,10 +348,27 @@ export async function scrape(raw: string, opts: ScrapeOptions = {}): Promise<Scr
     let data: unknown;
     try { data = JSON.parse(body); } catch { throw new ScrapeError("The response is not valid JSON."); }
     const datasets = extractJson(data);
-    return { ...base, kind: "json", ms: Date.now() - started, meta: { records: datasets[0]?.rows.length ?? 0 }, datasets };
+    return { ...base, pages: 1, kind: "json", ms: Date.now() - started, meta: { records: datasets[0]?.rows.length ?? 0 }, datasets };
   }
-  const { meta, datasets } = extractHtml(body, finalUrl, opts.selector?.trim() || undefined);
-  return { ...base, kind: "html", ms: Date.now() - started, meta, datasets };
+  const selector = opts.selector?.trim() || undefined;
+  const first = extractHtml(body, finalUrl, selector);
+  const pages = [first.datasets];
+  const maxPages = Math.min(10, Math.max(1, Math.floor(opts.pages ?? 1)));
+  let bytes = body.length;
+  let next = maxPages > 1 ? nextLink(body, finalUrl) : null;
+  const visited = new Set([finalUrl.toString()]);
+  while (next && pages.length < maxPages && Date.now() - started < 20_000 && !visited.has(next.toString())) {
+    visited.add(next.toString());
+    try {
+      const page = await get(next, allowPrivate, "text/html");
+      const html = await readCapped(page.res);
+      if (!page.res.ok) break;
+      bytes += html.length;
+      pages.push(extractHtml(html, page.url, selector).datasets);
+      next = nextLink(html, page.url);
+    } catch { break; }
+  }
+  return { ...base, bytes, pages: pages.length, kind: "html", ms: Date.now() - started, meta: first.meta, datasets: pages.length > 1 ? merge(pages) : first.datasets };
 }
 
 /* Per-instance rate limit: 20 requests a minute per client IP. */
