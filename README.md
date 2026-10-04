@@ -12,7 +12,7 @@ PricePulse crawls an e-commerce catalogue every day, validates every record, sto
 ![GitHub Actions](https://img.shields.io/badge/GitHub_Actions-daily_cron-2088FF?logo=githubactions&logoColor=white)
 [![tests](https://github.com/aghakazimali-ML/pricepulse/actions/workflows/tests.yml/badge.svg)](https://github.com/aghakazimali-ML/pricepulse/actions/workflows/tests.yml)
 
-**🔗 Live demo:** [pricepulse-ml.streamlit.app](https://pricepulse-ml.streamlit.app)
+**🔗 Live demo:** [pricepulse-ml.vercel.app](https://pricepulse-ml.vercel.app) (static snapshot of the warehouse; the full Streamlit app runs locally or on Streamlit Cloud)
 
 | Home | Price history | Pipeline health |
 |---|---|---|
@@ -228,6 +228,12 @@ The dashboard reads `DATABASE_URL` (env, `.env` or Streamlit secrets). Without i
 2. Push to GitHub.
 3. On share.streamlit.io choose the repo, main file `dashboard/Home.py`, Python 3.11.
 4. Optional: add a `DATABASE_URL` secret pointing at a hosted Postgres to show live data instead.
+
+### Deploy the static dashboard to Vercel
+`web/` is a static React build of the same five pages (21st.dev kit, Recharts, Motion) that reads `web/public/data.json`.
+1. `python scripts/export_static.py` writes `data.json` from the database (`demo-db.yml` does this automatically).
+2. `cd web && npm ci && npm run dev` to preview, `npm run build` for `web/dist`.
+3. On Vercel, import the repo with **Root Directory `web`**; `web/vercel.json` sets the Vite build. Every push to `main` then redeploys.
 
 ## Scheduling with GitHub Actions
 
