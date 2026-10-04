@@ -18,7 +18,7 @@ PricePulse crawls an e-commerce catalogue every day, validates every record, sto
 |---|---|---|
 | ![Home](docs/screenshots/home.png) | ![Price history](docs/screenshots/price_history.png) | ![Pipeline health](docs/screenshots/pipeline_health.png) |
 
-*Screenshot placeholders: run the dashboard and save captures to `docs/screenshots/`.*
+![Dashboard tour](docs/screenshots/demo.gif)
 
 ---
 

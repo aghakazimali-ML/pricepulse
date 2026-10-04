@@ -37,7 +37,8 @@ pio.templates.default = "plotly_dark+pricepulse"
 _CSS = """
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono&display=swap');
-html, body, [class*="st-"], .stMarkdown, button, input { font-family: 'Geist', ui-sans-serif, system-ui, sans-serif; }
+html, body, .stApp, .stMarkdown, p, label, button, input, textarea {
+  font-family: 'Geist', ui-sans-serif, system-ui, sans-serif; }
 code { font-family: 'Geist Mono', ui-monospace, monospace; }
 .block-container { padding-top: 2.4rem; max-width: 1280px; }
 [data-testid="stSidebar"] { background: #0A0A0A; border-right: 1px solid #262626; }
@@ -54,8 +55,8 @@ code { font-family: 'Geist Mono', ui-monospace, monospace; }
   border-radius: 6px; padding: 1px 7px; }
 .pp-brand { font-size: 15px; font-weight: 600; letter-spacing: -0.02em; color: #FAFAFA; }
 .pp-muted { font-size: 12.5px; color: #A3A3A3; line-height: 1.55; }
-[data-baseweb="tag"] { background: #262626 !important; border: 1px solid #333 !important; }
-[data-baseweb="tag"] span, [data-baseweb="tag"] svg { color: #FAFAFA !important; fill: #FAFAFA !important; }
+[data-baseweb="tag"], [data-tag] { background: #262626 !important; border: 1px solid #333 !important; }
+[data-baseweb="tag"] span, [data-tag] span, [data-tag] svg { color: #FAFAFA !important; fill: #FAFAFA !important; }
 footer { visibility: hidden; }
 </style>
 """

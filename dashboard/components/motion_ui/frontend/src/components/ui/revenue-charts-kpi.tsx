@@ -2,12 +2,12 @@
 
 import * as React from "react";
 import { cn } from "@/lib/utils";
-import { ArrowDownRight, ArrowUpRight } from "lucide-react";
+import { ArrowDownRight, ArrowUpRight, Minus } from "lucide-react";
 import { Area, AreaChart, Bar, BarChart, CartesianGrid, Cell, Line, LineChart, Pie, PieChart, ResponsiveContainer, Tooltip as RTooltip, XAxis, YAxis, type TooltipProps } from "recharts";
 
 /* Layro System · ChartCard (21st.dev: @uvain/revenue-charts-kpi). Composed from the Layro UI source into one file.
    Themed with shadcn/ui tokens; follows your globals.css in light and dark.
-   PricePulse changes: Sparkline and KpiCard accept a `slot`; BarCompare accepts `layout="vertical"`. */
+   PricePulse changes: Sparkline and KpiCard accept a `slot`; BarCompare accepts `layout="vertical"`; KpiCard shows ~0% as neutral. */
 
 /* ------------------------------------------------------------ tokens -- */
 
@@ -408,6 +408,8 @@ export interface KpiCardProps extends React.HTMLAttributes<HTMLDivElement> {
 
 export function KpiCard({ label, value, delta, good = "up", period, trend, slot = 1, className, ...rest }: KpiCardProps) {
   const up = (delta ?? 0) >= 0;
+  // PricePulse: changes that round to 0.0% are shown as neutral rather than good/bad.
+  const flat = delta !== undefined && Math.abs(delta) < 0.0005;
   const positive = delta === undefined ? null : (up && good === "up") || (!up && good === "down");
   return (
     <div className={cn("grid gap-2 rounded-[14px] bg-card p-4 text-card-foreground ring-1 ring-border", SQUIRCLE, className)} {...rest}>
@@ -418,9 +420,9 @@ export function KpiCard({ label, value, delta, good = "up", period, trend, slot 
       </div>
       {delta !== undefined && (
         <p className="flex items-center gap-1 text-[12px]">
-          <span className={cn("inline-flex items-center gap-0.5 font-medium tabular-nums", positive ? "text-emerald-700 dark:text-emerald-400" : "text-red-700 dark:text-red-400")}>
-            {up ? <ArrowUpRight className="size-3.5" aria-hidden /> : <ArrowDownRight className="size-3.5" aria-hidden />}
-            <span className="sr-only">{up ? "Up" : "Down"} </span>
+          <span className={cn("inline-flex items-center gap-0.5 font-medium tabular-nums", flat ? "text-muted-foreground" : positive ? "text-emerald-700 dark:text-emerald-400" : "text-red-700 dark:text-red-400")}>
+            {flat ? <Minus className="size-3.5" aria-hidden /> : up ? <ArrowUpRight className="size-3.5" aria-hidden /> : <ArrowDownRight className="size-3.5" aria-hidden />}
+            <span className="sr-only">{flat ? "Unchanged" : up ? "Up" : "Down"} </span>
             {Math.abs(delta * 100).toFixed(1)}%
           </span>
           {period && <span className="text-muted-foreground">{period}</span>}
