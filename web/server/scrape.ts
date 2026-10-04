@@ -171,7 +171,9 @@ function fields(el: HTMLElement, base: URL): Record<string, Cell> {
   const heading = el.querySelector("h1, h2, h3, h4, h5, h6");
   const img = el.querySelector("img");
   const titled = el.querySelector("[title]");
-  const title = titled?.getAttribute("title") || text(heading) || img?.getAttribute("alt") || text(link) || text(el).slice(0, 120);
+  const leaf = el.querySelectorAll("span, p, div, small, strong, em, td").filter((c) => c.childNodes.every((n) => n.nodeType === 3)).map(text).sort((a, b) => b.length - a.length)[0];
+  const linkText = text(link);
+  const title = titled?.getAttribute("title") || text(heading) || img?.getAttribute("alt") || (linkText.length > 12 ? linkText : "") || leaf || linkText || text(el).slice(0, 120);
   const full = (el.structuredText ?? el.text).replace(/\s+/g, " ");
   const priceMatch = full.match(PRICE);
   const ratingEl = el.querySelector("[class*=star], [class*=rating]");
@@ -183,6 +185,8 @@ function fields(el: HTMLElement, base: URL): Record<string, Cell> {
   else if (ratingText && num(ratingText) !== null) row.rating = num(ratingText);
   const stock = full.match(/(out of stock|sold out|unavailable|in stock|available)/i);
   if (stock) row.availability = stock[0];
+  const time = el.querySelector("time");
+  if (time) row.date = time.getAttribute("datetime") || text(time);
   if (link) row.link = abs(link.getAttribute("href"), base);
   if (img) row.image = abs(img.getAttribute("src") || img.getAttribute("data-src"), base);
   return row;
@@ -219,6 +223,40 @@ function priceCards(root: HTMLElement, base: URL): Record<string, Cell>[] {
   }
   const best = [...groups.values()].filter((g) => g.length >= 3).sort((a, b) => b.length - a.length)[0];
   return best ? best.map((el) => fields(el, base)) : [];
+}
+
+/* Repeated items without prices: articles, job posts, listings, search results.
+   Siblings that share a tag and class, each holding a link plus a heading, image, paragraph or date. */
+function repeatedItems(root: HTMLElement, base: URL): Record<string, Cell>[] {
+  const groups = new Map<string, HTMLElement[]>();
+  for (const el of root.querySelectorAll("*")) {
+    if (["SCRIPT", "STYLE", "HTML", "BODY", "HEAD", "NAV", "HEADER", "FOOTER"].includes(el.tagName)) continue;
+    const sig = signature(el);
+    if (sig.endsWith(".") && !["LI", "ARTICLE", "TR", "SECTION"].includes(el.tagName)) continue;
+    if (el.closest("nav, header, footer")) continue;
+    const t = text(el);
+    if (t.length < 20 || t.length > 3000) continue;
+    if (!el.querySelector("a[href]")) continue;
+    if (!el.querySelector("h1, h2, h3, h4, h5, h6, img, p, time") && el.querySelectorAll("[class]").length < 3) continue;
+    const parent = el.parentNode as HTMLElement | null;
+    const key = `${parent ? signature(parent) : ""}>${sig}`;
+    groups.set(key, [...(groups.get(key) ?? []), el]);
+  }
+  const avgLen = (g: HTMLElement[]) => g.reduce((n, el) => n + Math.min(400, text(el).length), 0) / g.length;
+  const best = [...groups.values()].filter((g) => g.length >= 3).sort((a, b) => b.length - a.length || avgLen(b) - avgLen(a))[0];
+  return best ? best.map((el) => ({ ...fields(el, base), ...classFields(el) })) : [];
+}
+
+/* JSON that JavaScript apps ship inside the page (Next.js __NEXT_DATA__, application/json blocks). */
+function embeddedJson(root: HTMLElement): Dataset[] {
+  const out: Dataset[] = [];
+  for (const s of root.querySelectorAll('script#__NEXT_DATA__, script[type="application/json"]')) {
+    try {
+      const sets = extractJson(JSON.parse(s.text)).filter((d) => d.rows.length >= 3);
+      out.push(...sets.map((d) => ({ ...d, name: `embedded data ${d.name}`.slice(0, 60), description: `${d.rows.length} records from JSON embedded in the page` })));
+    } catch { /* not JSON */ }
+  }
+  return out.sort((a, b) => b.rows.length - a.rows.length).slice(0, 2);
 }
 
 function jsonLd(root: HTMLElement): Record<string, Cell>[] {
@@ -278,7 +316,15 @@ export function extractHtml(html: string, base: URL, selector?: string): { meta:
   if (cards.length) datasets.push(toDataset("products", `${cards.length} repeated items with prices`, cards));
   const ld = jsonLd(root);
   if (ld.length) datasets.push(toDataset("structured data", `${ld.length} schema.org records (JSON-LD)`, ld));
+  if (!cards.length) {
+    const items = repeatedItems(root, base);
+    if (items.length) datasets.push(toDataset("items", `${items.length} repeated items`, items));
+  }
+  datasets.push(...embeddedJson(root));
   datasets.push(...tables(root));
+  // Little visible text but plenty of script: the content is rendered by JavaScript in the browser.
+  const bodyText = text(root.querySelector("body") ?? root).length;
+  if (bodyText < 400 && root.querySelectorAll("script").length >= 1) meta.needs_js = 1;
   if (!datasets.some((d) => d.rows.length)) {
     const headings = root.querySelectorAll("h1, h2, h3").map((h) => ({ level: h.tagName.toLowerCase(), text: text(h) })).filter((h) => h.text);
     if (headings.length) datasets.push(toDataset("headings", "Page headings", headings));

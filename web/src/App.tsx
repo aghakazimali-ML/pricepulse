@@ -243,8 +243,14 @@ function Home({ d }: { d: Data }) {
             <BarCompare data={priceBands(prices)} xKey="band" series={[{ key: "items", label: "Records" }]} height={240} description="How many records fall in each price range" />
           </Card>
         ) : (
-          <Card title="Records by category" subtitle="Latest run">
-            <BarCompare data={d.categories.slice(0, 10)} xKey="category" series={[{ key: "products", label: "Records" }]} layout="vertical" height={240} description="Records per category" />
+          <Card title="Latest records" subtitle={`First ${Math.min(8, d.products.length)} of ${int(d.products.length)}`}>
+            <Table
+              rows={d.products.slice(0, 8)}
+              columns={[
+                { key: "title", label: "Title", render: (p) => <CellView v={p.title} /> },
+                { key: "category", label: "Category", render: (p) => <span className="text-muted-foreground">{p.category}</span> },
+              ]}
+            />
           </Card>
         )}
         {ratings.length > 0 ? (
@@ -796,7 +802,9 @@ function Scrape(_: { d?: Data | null }) {
             <p className="m-0 text-[13px] text-foreground">
               {loaded.ok
                 ? <>Loaded <b>{int(loaded.items.length)}</b> clean records from <b>{saved.label}</b>{loaded.pages > 1 ? ` across ${loaded.pages} pages` : ""}{loaded.rejected.length ? `, ${loaded.rejected.length} rejected` : ""}. The whole dashboard now shows this source.</>
-                : <>The page loaded but no records were found, so the dashboard is unchanged. Try a CSS selector for the items.</>}
+                : result.meta?.needs_js
+                  ? <>The site answered, but it builds its content with JavaScript in the browser, so the HTML PricePulse receives has no records. The dashboard is unchanged. Try the site's own JSON API instead (in Chrome: Inspect, Network, Fetch/XHR, then copy a JSON URL and paste it here).</>
+                  : <>The site answered, but PricePulse couldn't spot a list of repeated items, tables or records on it, so the dashboard is unchanged. Tell it which element is one item: right-click an item, choose Inspect, copy its class (for example <code>.product-card</code>) into the CSS selector box and scrape again.</>}
             </p>
             {loaded.ok && (
               <div className="flex flex-wrap gap-2">

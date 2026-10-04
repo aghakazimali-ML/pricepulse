@@ -77,8 +77,10 @@ const toNum = (v: Cell): number | null => {
 /* The dataset that best represents the page's records. */
 export function primaryDataset(r: ScrapeResult): ScrapeDataset | undefined {
   const order = (d: ScrapeDataset) =>
-    d.name.startsWith("selector") ? 0 : d.name === "products" ? 1 : d.name === "structured data" ? 2 : r.kind === "json" ? 3 : d.name.startsWith("table") ? 4 : d.name === "links" ? 9 : 5;
-  return [...r.datasets].filter((d) => d.rows.length).sort((a, b) => order(a) - order(b))[0];
+    d.name.startsWith("selector") ? 0 : d.name === "products" ? 1 : d.name === "structured data" ? 2 : d.name === "items" ? 3
+      : d.name.startsWith("embedded data") || r.kind === "json" ? 4 : d.name.startsWith("table") ? 5 : d.name === "headings" ? 8 : d.name === "links" ? 9 : 6;
+  // Navigation links alone are not records; treat a page with nothing else as empty.
+  return [...r.datasets].filter((d) => d.rows.length && d.name !== "links" && d.name !== "headings").sort((a, b) => order(a) - order(b))[0];
 }
 
 export function currencyOf(ds: ScrapeDataset): string {
@@ -129,7 +131,8 @@ export function snapshotFrom(r: ScrapeResult): Snapshot {
   const ds = primaryDataset(r);
   const { items, rejected } = ds ? normalise(ds) : { items: [], rejected: [] };
   return {
-    at: new Date().toISOString(), ms: r.ms, ok: items.length > 0, error: items.length ? undefined : "No records found on this page",
+    at: new Date().toISOString(), ms: r.ms, ok: items.length > 0,
+    error: items.length ? undefined : r.meta?.needs_js ? "The page is built by JavaScript, so its HTML has no records" : "No repeated items, tables or records found on this page",
     pages: r.pages ?? 1, bytes: r.bytes, status: r.status, dataset: ds?.name ?? "none", columns: ds?.columns ?? [], items, rejected,
   };
 }
