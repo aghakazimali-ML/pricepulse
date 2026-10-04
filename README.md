@@ -229,11 +229,13 @@ The dashboard reads `DATABASE_URL` (env, `.env` or Streamlit secrets). Without i
 3. On share.streamlit.io choose the repo, main file `dashboard/Home.py`, Python 3.11.
 4. Optional: add a `DATABASE_URL` secret pointing at a hosted Postgres to show live data instead.
 
-### Deploy the static dashboard to Vercel
-`web/` is a static React build of the same five pages (21st.dev kit, Recharts, Motion) that reads `web/public/data.json`.
-1. `python scripts/export_static.py` writes `data.json` from the database (`demo-db.yml` does this automatically).
-2. `cd web && npm ci && npm run dev` to preview, `npm run build` for `web/dist`.
-3. On Vercel, import the repo with **Root Directory `web`**; `web/vercel.json` sets the Vite build. Every push to `main` then redeploys.
+### Live scraper and the Vercel deploy
+`web/` is the hosted version: a React build of the dashboard pages (21st.dev kit, Recharts, Motion) that reads `web/public/data.json`, plus a **Scrape a site** page backed by a serverless function (`web/server/scrape.ts`, served at `/api/scrape`).
+
+- **Scrape a site:** paste a website or JSON API URL. The function fetches it server-side and returns tables you can download as CSV or JSON. For web pages it finds repeated product cards (title, price, rating, stock, link, image), schema.org JSON-LD, HTML tables and links, or the items matching an optional CSS selector. For APIs it finds the largest list of records and flattens nested fields. It checks robots.txt, sends an identifying user agent, only allows public http(s) hosts (every DNS answer and redirect hop is checked), and caps each request at 10 s and 3 MB. Pages that need JavaScript to render still need the Playwright source in the pipeline.
+- `python scripts/export_static.py` writes `data.json` from the database (`demo-db.yml` does this automatically).
+- `cd web && npm ci && npm run dev` serves the site and `/api/scrape` locally. `npm run build` writes `web/.vercel/output` (static files plus the function) in Vercel's Build Output format.
+- On Vercel, import the repo with **Root Directory `web`**. Every push to `main` then redeploys.
 
 ## Scheduling with GitHub Actions
 

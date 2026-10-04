@@ -23,6 +23,7 @@ logs/*
 # Frontend build tooling (the built bundle in frontend/dist IS committed)
 node_modules/
 web/dist/
+web/.vercel/
 
 # OS / editors
 .DS_Store

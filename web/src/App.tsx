@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { motion, useReducedMotion } from "motion/react";
-import { Activity, BarChart3, History, LayoutGrid, Package, Search } from "lucide-react";
+import { Activity, BarChart3, Download, Globe, History, LayoutGrid, Loader2, Package, Play, Radar, Search } from "lucide-react";
 import { AreaTrend, BarCompare, ChartCard, DonutBreakdown, KpiCard, type Series } from "@/components/ui/revenue-charts-kpi";
 import { cn } from "@/lib/utils";
 import type { Data, Product, Run } from "./types";
@@ -518,10 +518,254 @@ function Health({ d }: { d: Data }) {
   );
 }
 
+/* -------------------------------------------------------------- scrape -- */
+
+type Cell = string | number | boolean | null;
+interface ScrapeDataset { name: string; description: string; columns: string[]; rows: Record<string, Cell>[] }
+interface ScrapeResult {
+  url: string; finalUrl: string; status: number; contentType: string; kind: "html" | "json"; bytes: number; ms: number;
+  robots: string; meta: Record<string, string | number>; datasets: ScrapeDataset[];
+}
+
+const PRESETS = [
+  { label: "Books to Scrape", url: "https://books.toscrape.com/", mode: "auto", selector: "" },
+  { label: "Quotes (CSS selector)", url: "https://quotes.toscrape.com/", mode: "html", selector: ".quote" },
+  { label: "JSON API: products", url: "https://dummyjson.com/products?limit=100", mode: "json", selector: "" },
+  { label: "JSON API: users", url: "https://jsonplaceholder.typicode.com/users", mode: "json", selector: "" },
+];
+
+const csvCell = (v: Cell | undefined) => {
+  const s = v === null || v === undefined ? "" : String(v);
+  return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+};
+
+function download(name: string, body: string, type: string) {
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([body], { type }));
+  a.download = name;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+}
+
+function CellView({ v }: { v: Cell | undefined }) {
+  if (v === null || v === undefined || v === "") return <span className="text-muted-foreground">–</span>;
+  if (typeof v === "string" && /^https?:\/\//.test(v)) {
+    return <a href={v} target="_blank" rel="noreferrer" className="text-foreground underline decoration-border underline-offset-2 hover:decoration-foreground">{v.replace(/^https?:\/\/(www\.)?/, "").slice(0, 48)}</a>;
+  }
+  const s = String(v);
+  return <span title={s.length > 90 ? s : undefined}>{s.length > 90 ? `${s.slice(0, 90)}…` : s}</span>;
+}
+
+function priceBands(rows: Record<string, Cell>[], key: string) {
+  const xs = rows.map((r) => r[key]).filter((v): v is number => typeof v === "number" && isFinite(v));
+  if (xs.length < 5) return null;
+  const lo = Math.min(...xs), hi = Math.max(...xs);
+  const step = (hi - lo) / 6 || 1;
+  const f = (v: number) => (hi - lo < 12 ? v.toFixed(1) : String(Math.round(v)));
+  const bands = Array.from({ length: 6 }, (_, i) => ({ band: `${f(lo + i * step)}–${f(lo + (i + 1) * step)}`, items: 0 }));
+  xs.forEach((x) => { bands[Math.min(5, Math.floor((x - lo) / step))].items += 1; });
+  return { bands, min: lo, max: hi, avg: mean(xs), n: xs.length };
+}
+
+function Scrape(_: { d?: Data | null }) {
+  const [url, setUrl] = useState("https://books.toscrape.com/");
+  const [mode, setMode] = useState("auto");
+  const [selector, setSelector] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [result, setResult] = useState<ScrapeResult | null>(null);
+  const [tab, setTab] = useState(0);
+
+  async function run(u = url, m = mode, sel = selector) {
+    if (!u.trim()) return;
+    setBusy(true); setError(null);
+    try {
+      const qs = new URLSearchParams({ url: u.trim(), mode: m });
+      if (sel.trim()) qs.set("selector", sel.trim());
+      const res = await fetch(`/api/scrape?${qs}`);
+      const body = await res.json().catch(() => ({ error: `The scraper answered with HTTP ${res.status}.` }));
+      if (!res.ok) throw new Error(body.error ?? `HTTP ${res.status}`);
+      setResult(body); setTab(0);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e)); setResult(null);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const ds = result?.datasets[tab];
+  const priceKey = ds?.columns.find((c) => /(^|\.)price$/i.test(c)) ?? ds?.columns.find((c) => /price|amount|cost/i.test(c) && ds.rows.some((r) => typeof r[c] === "number"));
+  const prices = ds && priceKey ? priceBands(ds.rows, priceKey) : null;
+  const total = result?.datasets.filter((d) => d.name !== "links").reduce((n, d) => n + d.rows.length, 0) ?? 0;
+  const slug = result ? new URL(result.finalUrl).hostname.replace(/^www\./, "") : "scrape";
+
+  return (
+    <>
+      <Header
+        eyebrow="Live scraper"
+        title="Scrape a website or API"
+        description="Paste a public web page or JSON API URL. PricePulse fetches it on the server, checks robots.txt, finds the repeated items, tables and records, and returns them as clean rows you can download."
+      />
+      <Reveal delay={0.04}>
+        <form
+          onSubmit={(e) => { e.preventDefault(); run(); }}
+          className="grid gap-3 rounded-[18px] bg-card p-5 ring-1 ring-border [corner-shape:squircle]"
+        >
+          <div className="flex flex-wrap gap-2">
+            <label className="relative min-w-[240px] flex-1">
+              <span className="sr-only">URL to scrape</span>
+              <Globe className="pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2 text-muted-foreground" aria-hidden />
+              <input
+                className={cn(inputCls, "h-11 w-full pl-9 text-[14px]")}
+                type="text"
+                inputMode="url"
+                placeholder="https://example.com/products or https://api.example.com/items"
+                value={url}
+                onChange={(e) => setUrl(e.target.value)}
+              />
+            </label>
+            <label>
+              <span className="sr-only">Source type</span>
+              <select className={cn(inputCls, "h-11")} value={mode} onChange={(e) => setMode(e.target.value)}>
+                <option value="auto">Auto detect</option>
+                <option value="html">Website (HTML)</option>
+                <option value="json">API (JSON)</option>
+              </select>
+            </label>
+            <button
+              type="submit"
+              disabled={busy}
+              className="inline-flex h-11 cursor-pointer items-center gap-2 rounded-[10px] border-0 bg-foreground px-5 text-[14px] font-medium text-[oklch(0.145_0_0)] disabled:cursor-wait disabled:opacity-60"
+            >
+              {busy ? <Loader2 className="size-4 animate-spin" aria-hidden /> : <Play className="size-4" aria-hidden />}
+              {busy ? "Scraping…" : "Scrape"}
+            </button>
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            <label className="relative min-w-[220px] flex-1 sm:max-w-[340px]">
+              <span className="sr-only">Optional CSS selector for items</span>
+              <input className={cn(inputCls, "w-full font-mono text-[12.5px]")} placeholder="Optional CSS selector, e.g. .product-card" value={selector} onChange={(e) => setSelector(e.target.value)} />
+            </label>
+            <span className="text-[12px] text-muted-foreground">Try:</span>
+            {PRESETS.map((p) => (
+              <button
+                key={p.label}
+                type="button"
+                onClick={() => { setUrl(p.url); setMode(p.mode); setSelector(p.selector); run(p.url, p.mode, p.selector); }}
+                className="cursor-pointer rounded-full border-0 bg-muted px-2.5 py-1 text-[12px] text-foreground ring-1 ring-border hover:bg-accent"
+              >
+                {p.label}
+              </button>
+            ))}
+          </div>
+        </form>
+      </Reveal>
+
+      {error && (
+        <Reveal>
+          <p role="alert" className="m-0 rounded-[12px] bg-red-500/10 px-4 py-3 text-[13px] text-red-300 ring-1 ring-red-500/30">{error}</p>
+        </Reveal>
+      )}
+
+      {busy && !result && (
+        <div className="grid gap-3" aria-busy>
+          {[96, 320].map((h) => <div key={h} className="animate-pulse rounded-[14px] bg-card" style={{ height: h }} />)}
+        </div>
+      )}
+
+      {result && ds && (
+        <>
+          <Kpis
+            key={result.finalUrl + result.ms}
+            cards={[
+              { label: "HTTP status", value: String(result.status), period: result.kind === "json" ? "JSON API" : "HTML page" },
+              { label: "Records found", value: int(total), period: `${result.datasets.length} datasets` },
+              { label: "Fetch and parse", value: `${(result.ms / 1000).toFixed(2)}s`, period: `${(result.bytes / 1024).toFixed(0)} KB` },
+              { label: "robots.txt", value: result.robots === "allowed" ? "Allowed" : result.robots === "skipped" ? "Skipped" : "None found", period: result.robots === "skipped" ? "APIs are not checked" : "checked before fetching" },
+            ]}
+          />
+          {result.kind === "html" && (result.meta.title || result.meta.description) && (
+            <Reveal delay={0.05}>
+              <p className="m-0 text-[13px] text-muted-foreground">
+                <span className="font-medium text-foreground">{result.meta.title}</span>
+                {result.meta.description ? ` · ${result.meta.description}` : ""}
+              </p>
+            </Reveal>
+          )}
+          {prices && (
+            <div className="grid gap-4 lg:grid-cols-[1fr_2fr]">
+              <Kpis
+                cards={[
+                  { label: `Lowest ${priceKey}`, value: prices.min.toFixed(2) },
+                  { label: `Average ${priceKey}`, value: prices.avg.toFixed(2) },
+                  { label: `Highest ${priceKey}`, value: prices.max.toFixed(2) },
+                ]}
+              />
+              <Card title="Price distribution" subtitle={`${prices.n} items in ${ds.name}`}>
+                <BarCompare data={prices.bands} xKey="band" series={[{ key: "items", label: "Items" }]} height={200} description="How many scraped items fall in each price range" />
+              </Card>
+            </div>
+          )}
+          <Card
+            title="Scraped data"
+            subtitle={`${ds.description} · showing ${Math.min(ds.rows.length, 100)} of ${ds.rows.length}`}
+            actions={
+              <div className="flex gap-2">
+                <button type="button" onClick={() => download(`${slug}-${ds.name.replace(/\W+/g, "-")}.csv`, [ds.columns.join(","), ...ds.rows.map((r) => ds.columns.map((c) => csvCell(r[c])).join(","))].join("\n"), "text/csv")}
+                  className="inline-flex h-8 cursor-pointer items-center gap-1.5 rounded-[8px] border-0 bg-muted px-3 text-[12px] text-foreground ring-1 ring-border hover:bg-accent">
+                  <Download className="size-3.5" aria-hidden /> CSV
+                </button>
+                <button type="button" onClick={() => download(`${slug}-${ds.name.replace(/\W+/g, "-")}.json`, JSON.stringify(ds.rows, null, 2), "application/json")}
+                  className="inline-flex h-8 cursor-pointer items-center gap-1.5 rounded-[8px] border-0 bg-muted px-3 text-[12px] text-foreground ring-1 ring-border hover:bg-accent">
+                  <Download className="size-3.5" aria-hidden /> JSON
+                </button>
+              </div>
+            }
+          >
+            <div role="tablist" aria-label="Datasets" className="flex flex-wrap gap-1.5">
+              {result.datasets.map((d, i) => (
+                <button key={d.name + i} role="tab" type="button" aria-selected={i === tab} onClick={() => setTab(i)}
+                  className={cn("cursor-pointer rounded-[8px] border-0 px-2.5 py-1 text-[12px] ring-1 ring-border", i === tab ? "bg-foreground text-[oklch(0.145_0_0)]" : "bg-transparent text-muted-foreground hover:text-foreground")}>
+                  {d.name} <span className="tabular-nums opacity-70">{d.rows.length}</span>
+                </button>
+              ))}
+            </div>
+            <div className="max-h-[560px] overflow-auto">
+              <Table
+                rows={ds.rows.slice(0, 100)}
+                empty="This dataset is empty."
+                columns={ds.columns.map((c) => ({ key: c, label: c, render: (r: Record<string, Cell>) => <CellView v={r[c]} /> }))}
+              />
+            </div>
+          </Card>
+        </>
+      )}
+
+      {!result && !busy && !error && (
+        <Reveal delay={0.08}>
+          <div className="grid gap-3 sm:grid-cols-3">
+            {[
+              ["Websites", "Finds repeated product cards (title, price, rating, stock, link, image), schema.org data, HTML tables and links."],
+              ["JSON APIs", "Finds the biggest list of records in the response and flattens nested fields into columns."],
+              ["Polite by default", "Checks robots.txt, identifies itself, blocks private addresses and caps time and size."],
+            ].map(([t, d]) => (
+              <div key={t} className="grid gap-1 rounded-[14px] bg-card p-4 ring-1 ring-border">
+                <p className="m-0 text-[13px] font-medium">{t}</p>
+                <p className="m-0 text-[12.5px] leading-relaxed text-muted-foreground">{d}</p>
+              </div>
+            ))}
+          </div>
+        </Reveal>
+      )}
+    </>
+  );
+}
+
 /* ----------------------------------------------------------------- app -- */
 
 const PAGES = [
   { id: "home", label: "Home", icon: LayoutGrid, view: Home },
+  { id: "scrape", label: "Scrape a site", icon: Radar, view: Scrape },
   { id: "products", label: "Products", icon: Package, view: Products },
   { id: "history", label: "Price History", icon: History, view: PriceHistory },
   { id: "insights", label: "Insights", icon: BarChart3, view: Insights },
@@ -589,12 +833,12 @@ export default function App() {
       </aside>
       <main className="mx-auto grid w-full max-w-[1240px] content-start gap-5 px-4 py-6 md:px-8 md:py-8">
         {error && <p className="text-[13px] text-red-400">Could not load data.json ({error}).</p>}
-        {!data && !error && (
+        {!data && !error && page !== "scrape" && (
           <div className="grid gap-4" aria-busy>
             {[64, 96, 280].map((h) => <div key={h} className="animate-pulse rounded-[14px] bg-card" style={{ height: h }} />)}
           </div>
         )}
-        {data && <View key={page} d={data} />}
+        {(data || page === "scrape") && <View key={page} d={data!} />}
         <footer className="mt-4 border-t border-border pt-4 text-[12px] text-muted-foreground md:hidden">
           <a href={REPO} className="text-foreground">Source on GitHub</a>
         </footer>

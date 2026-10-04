@@ -1,6 +1,4 @@
 {
-  "framework": "vite",
-  "buildCommand": "npm run build",
-  "outputDirectory": "dist",
-  "headers": [{ "source": "/data.json", "headers": [{ "key": "Cache-Control", "value": "public, max-age=0, must-revalidate" }] }]
+  "framework": null,
+  "buildCommand": "npm run build"
 }
