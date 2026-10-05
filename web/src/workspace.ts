@@ -154,9 +154,11 @@ export function currencyOf(ds: ScrapeDataset): string {
   for (const r of ds.rows.slice(0, 20)) {
     const cur = pick(r, ["currency", "pricecurrency"]);
     if (typeof cur === "string") return ({ GBP: "£", USD: "$", EUR: "€", INR: "₹", JPY: "¥" } as Record<string, string>)[cur.toUpperCase()] ?? `${cur} `;
-    const txt = pick(r, ["price_text"]);
-    const sym = typeof txt === "string" ? txt.match(/[£$€¥₹]/) : null;
-    if (sym) return sym[0];
+    // A currency symbol next to a number in any text cell, e.g. price_text "£51.77".
+    for (const v of Object.values(r)) {
+      const sym = typeof v === "string" && v.length < 40 ? v.match(/([£$€¥₹])\s?\d/) : null;
+      if (sym) return sym[1];
+    }
   }
   return "";
 }

@@ -696,13 +696,13 @@ const BOOK_DETAIL_RECIPE: Recipe = {
   item: "article.product_pod",
   fields: [
     { name: "title", selector: "h3 a", type: "attr", attr: "title" },
-    { name: "price", selector: ".price_color", type: "number" },
+    { name: "price", selector: ".price_color", type: "text" },
     { name: "availability", selector: ".availability", type: "text" },
     { name: "link", selector: "h3 a", type: "link" },
     { name: "image", selector: "img", type: "image" },
   ],
   next: "li.next a",
-  follow: { field: "link", limit: 10, fields: [
+  follow: { field: "link", limit: 25, fields: [
     { name: "category", selector: ".breadcrumb li:nth-child(3)", type: "text" },
     { name: "upc", selector: "table tr td", type: "text" },
     { name: "description", selector: "#product_description + p", type: "text" },
