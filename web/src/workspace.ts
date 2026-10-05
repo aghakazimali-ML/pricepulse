@@ -21,6 +21,70 @@ export interface Snapshot {
 export interface LiveSource {
   id: string; url: string; label: string; mode: string; selector: string; pages: number;
   currency: string; snapshots: Snapshot[];
+  recipe?: Recipe | null; parsers?: Parser[]; every?: number;
+}
+
+/* Custom fields, like a Web Scraper sitemap (see server/scrape.ts). */
+export type FieldType = "text" | "number" | "link" | "image" | "attr" | "html";
+export interface FieldSpec { name: string; selector: string; type: FieldType; attr?: string; multiple?: boolean }
+export interface Recipe { item?: string; fields: FieldSpec[]; next?: string; follow?: { field: string; fields: FieldSpec[]; limit?: number } }
+
+/* Clean-up steps run on every scrape of a source, like Web Scraper's parser. */
+export type ParserOp = "whitespace" | "replace" | "regex" | "prepend" | "append" | "strip_html" | "number" | "unix_time" | "rename" | "remove";
+export interface Parser { column: string; op: ParserOp; a?: string; b?: string }
+export const PARSER_OPS: { op: ParserOp; label: string; a?: string; b?: string }[] = [
+  { op: "whitespace", label: "Trim whitespace" },
+  { op: "replace", label: "Replace text", a: "Find", b: "Replace with" },
+  { op: "regex", label: "Keep regex match", a: "Pattern, e.g. (\\d+) pages" },
+  { op: "prepend", label: "Add text before", a: "Text" },
+  { op: "append", label: "Add text after", a: "Text" },
+  { op: "strip_html", label: "Remove HTML tags" },
+  { op: "number", label: "Convert to number" },
+  { op: "unix_time", label: "UNIX time to date" },
+  { op: "rename", label: "Rename column", a: "New name" },
+  { op: "remove", label: "Remove column" },
+];
+
+function parseOne(v: Cell, p: Parser): Cell {
+  if (v === null || v === undefined) return v ?? null;
+  const str = String(v);
+  switch (p.op) {
+    case "whitespace": return str.replace(/\s+/g, " ").trim();
+    case "replace": return p.a ? str.split(p.a).join(p.b ?? "") : v;
+    case "regex": {
+      try { const m = str.match(new RegExp(p.a ?? "", "i")); return m ? (m[1] ?? m[0]) : null; } catch { return v; }
+    }
+    case "prepend": return `${p.a ?? ""}${str}`;
+    case "append": return `${str}${p.a ?? ""}`;
+    case "strip_html": return str.replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim();
+    case "number": return toNum(v);
+    case "unix_time": {
+      const n = toNum(v);
+      return n === null ? v : new Date(n < 1e11 ? n * 1000 : n).toISOString();
+    }
+    default: return v;
+  }
+}
+
+export function applyParsers(ds: ScrapeDataset, parsers: Parser[] = []): ScrapeDataset {
+  const steps = parsers.filter((p) => p.column.trim() && ds.columns.includes(p.column.trim()));
+  if (!steps.length) return ds;
+  let columns = [...ds.columns];
+  let rows = ds.rows.map((r) => ({ ...r }));
+  for (const p of steps) {
+    const col = p.column.trim();
+    if (!columns.includes(col)) continue;
+    if (p.op === "remove") {
+      columns = columns.filter((c) => c !== col);
+      rows.forEach((r) => delete r[col]);
+    } else if (p.op === "rename") {
+      const to = (p.a ?? "").trim();
+      if (!to || columns.includes(to)) continue;
+      columns = columns.map((c) => (c === col ? to : c));
+      rows = rows.map((r) => { const { [col]: v, ...rest } = r; return { ...rest, [to]: v ?? null }; });
+    } else rows.forEach((r) => { r[col] = parseOne(r[col], p); });
+  }
+  return { ...ds, columns, rows };
 }
 
 const KEY = "pricepulse.sources.v1";
@@ -43,11 +107,14 @@ export function saveSources(sources: LiveSource[]) {
   }
 }
 
-export const sourceId = (url: string, selector: string) => {
+const hash = (s: string) => { let h = 0; for (const ch of s) h = (h * 31 + ch.charCodeAt(0)) | 0; return (h >>> 0).toString(36); };
+
+export const sourceId = (url: string, selector: string, recipe?: Recipe | null) => {
+  const tag = `${selector ? `#${selector}` : ""}${recipe ? `#fields-${hash(JSON.stringify(recipe))}` : ""}`;
   try {
     const u = new URL(url);
-    return `${u.host}${u.pathname.replace(/\/$/, "")}${u.search}${selector ? `#${selector}` : ""}`;
-  } catch { return url; }
+    return `${u.host}${u.pathname.replace(/\/$/, "")}${u.search}${tag}`;
+  } catch { return url + tag; }
 };
 
 export function labelFor(url: string) {
@@ -77,7 +144,7 @@ const toNum = (v: Cell): number | null => {
 /* The dataset that best represents the page's records. */
 export function primaryDataset(r: ScrapeResult): ScrapeDataset | undefined {
   const order = (d: ScrapeDataset) =>
-    d.name.startsWith("selector") ? 0 : d.name === "products" ? 1 : d.name === "structured data" ? 2 : d.name === "items" ? 3
+    d.name === "custom fields" || d.name.startsWith("selector") ? 0 : d.name === "sitemap" ? 3 : d.name === "products" ? 1 : d.name === "structured data" ? 2 : d.name === "items" ? 3
       : d.name.startsWith("embedded data") || r.kind === "json" ? 4 : d.name.startsWith("table") ? 5 : d.name === "headings" ? 8 : d.name === "links" ? 9 : 6;
   // Navigation links alone are not records; treat a page with nothing else as empty.
   return [...r.datasets].filter((d) => d.rows.length && d.name !== "links" && d.name !== "headings").sort((a, b) => order(a) - order(b))[0];
@@ -101,8 +168,8 @@ export function normalise(ds: ScrapeDataset): { items: Item[]; rejected: Snapsho
   const rejected: Snapshot["rejected"] = [];
   const seen = new Set<string>();
   ds.rows.forEach((row, i) => {
-    const title = String(pick(row, ["title", "name", "headline", "product", "label", "text"]) ?? (firstText ? row[firstText] ?? "" : "")).trim();
-    const url = String(pick(row, ["link", "url", "href", "product_url", "permalink"]) ?? "");
+    const url = String(pick(row, ["link", "url", "href", "product_url", "permalink", "loc"]) ?? "");
+    const title = String(pick(row, ["title", "name", "headline", "product", "label", "text"]) ?? (firstText ? row[firstText] ?? "" : "")).trim() || url;
     const key = url || title || `row ${i + 1}`;
     if (!title) { rejected.push({ key, reason: "title: missing" }); return; }
     const price = priceCol ? toNum(row[priceCol]) : null;

@@ -21,7 +21,30 @@ export interface ScrapeResult {
   meta: Record<string, string | number>;
   datasets: Dataset[];
 }
-export interface ScrapeOptions { mode?: "auto" | "html" | "json"; selector?: string; pages?: number; allowPrivate?: boolean }
+export interface ScrapeOptions { mode?: "auto" | "html" | "json"; selector?: string; pages?: number; allowPrivate?: boolean; recipe?: Recipe }
+
+/* A user-built extraction plan, like a Web Scraper sitemap: an item selector, named fields,
+   an optional next-page selector, and optionally a link to open for each item's detail page. */
+export interface FieldSpec { name: string; selector: string; type: "text" | "number" | "link" | "image" | "attr" | "html"; attr?: string; multiple?: boolean }
+export interface Recipe { item?: string; fields: FieldSpec[]; next?: string; follow?: { field: string; fields: FieldSpec[]; limit?: number } }
+const FIELD_TYPES = ["text", "number", "link", "image", "attr", "html"];
+
+export function parseRecipe(raw: unknown): Recipe | undefined {
+  if (raw == null || raw === "") return undefined;
+  let r: any;
+  try { r = typeof raw === "string" ? JSON.parse(raw) : raw; } catch { throw new ScrapeError("The field recipe is not valid JSON."); }
+  const cleanFields = (fs: unknown): FieldSpec[] => (Array.isArray(fs) ? fs : []).slice(0, 30).map((f: any) => ({
+    name: String(f?.name ?? "").trim().slice(0, 60),
+    selector: String(f?.selector ?? "").trim().slice(0, 300),
+    type: FIELD_TYPES.includes(f?.type) ? f.type : "text",
+    attr: f?.attr ? String(f.attr).trim().slice(0, 60) : undefined,
+    multiple: Boolean(f?.multiple),
+  })).filter((f) => f.name);
+  const recipe: Recipe = { item: r?.item ? String(r.item).trim().slice(0, 300) : undefined, fields: cleanFields(r?.fields), next: r?.next ? String(r.next).trim().slice(0, 300) : undefined };
+  if (r?.follow?.field) recipe.follow = { field: String(r.follow.field), fields: cleanFields(r.follow.fields), limit: Math.min(25, Math.max(1, Number(r.follow.limit) || 10)) };
+  if (!recipe.fields.length) throw new ScrapeError("Add at least one field with a name to the recipe.");
+  return recipe;
+}
 
 export class ScrapeError extends Error {
   constructor(message: string, public status = 400) { super(message); }
@@ -90,11 +113,18 @@ async function get(url: URL, allowPrivate: boolean, accept: string): Promise<{ r
   throw new ScrapeError("Too many redirects.", 502);
 }
 
+const robotsCache = new Map<string, { at: number; txt: string[] | null }>();
 async function robotsAllows(url: URL, allowPrivate: boolean): Promise<ScrapeResult["robots"]> {
   try {
-    const { res } = await get(new URL("/robots.txt", url), allowPrivate, "text/plain");
-    if (!res.ok) return "not found";
-    const txt = (await readCapped(res)).split(/\r?\n/);
+    let cached = robotsCache.get(url.origin);
+    if (!cached || Date.now() - cached.at > 600_000) {
+      const { res } = await get(new URL("/robots.txt", url), allowPrivate, "text/plain");
+      cached = { at: Date.now(), txt: res.ok ? (await readCapped(res)).split(/\r?\n/) : null };
+      if (robotsCache.size > 500) robotsCache.clear();
+      robotsCache.set(url.origin, cached);
+    }
+    if (!cached.txt) return "not found";
+    const txt = cached.txt;
     let applies = false;
     const rules: { allow: boolean; path: string }[] = [];
     for (const raw of txt) {
@@ -295,7 +325,7 @@ function tables(root: HTMLElement): Dataset[] {
   }).filter((d) => d.rows.length >= 2).slice(0, 3);
 }
 
-export function extractHtml(html: string, base: URL, selector?: string): { meta: Record<string, string | number>; datasets: Dataset[] } {
+export function extractHtml(html: string, base: URL, selector?: string, recipe?: Recipe): { meta: Record<string, string | number>; datasets: Dataset[] } {
   const root = parse(html, { comment: false, blockTextElements: { script: true, style: true } });
   const metaTag = (n: string) => root.querySelector(`meta[name="${n}"], meta[property="${n}"]`)?.getAttribute("content") ?? "";
   const links = root.querySelectorAll("a[href]");
@@ -307,6 +337,10 @@ export function extractHtml(html: string, base: URL, selector?: string): { meta:
     images: root.querySelectorAll("img").length,
   };
   const datasets: Dataset[] = [];
+  if (recipe) {
+    const rows = recipeRows(root, base, recipe.fields, recipe.item);
+    datasets.push({ name: "custom fields", description: `${rows.length} items from your field recipe`, columns: recipe.fields.map((f) => f.name), rows });
+  }
   if (selector) {
     let items: HTMLElement[];
     try { items = root.querySelectorAll(selector); } catch { throw new ScrapeError("That CSS selector is not valid."); }
@@ -336,11 +370,67 @@ export function extractHtml(html: string, base: URL, selector?: string): { meta:
   return { meta, datasets };
 }
 
+/* --------------------------------------------------------------- recipe -- */
+
+function selectAll(scope: HTMLElement, selector: string): HTMLElement[] {
+  if (!selector || selector === "_self") return [scope];
+  try { return scope.querySelectorAll(selector); } catch { throw new ScrapeError(`"${selector}" is not a valid CSS selector.`); }
+}
+
+function fieldValue(el: HTMLElement, f: FieldSpec, base: URL): Cell {
+  switch (f.type) {
+    case "link": return abs((el.tagName === "A" ? el : el.querySelector("a[href]") ?? el).getAttribute("href"), base) || null;
+    case "image": { const img = el.tagName === "IMG" ? el : el.querySelector("img"); return abs(img?.getAttribute("src") || img?.getAttribute("data-src"), base) || null; }
+    case "attr": return el.getAttribute(f.attr || "href") ?? null;
+    case "html": return el.innerHTML.trim().slice(0, 5000);
+    case "number": return num(text(el));
+    default: return text(el);
+  }
+}
+
+export function recipeRows(root: HTMLElement, base: URL, fields: FieldSpec[], item?: string): Record<string, Cell>[] {
+  const items = item ? selectAll(root, item) : [root];
+  return items.slice(0, MAX_ROWS).map((el) => {
+    const row: Record<string, Cell> = {};
+    for (const f of fields) {
+      const hits = selectAll(el, f.selector);
+      if (f.multiple) {
+        const vals = hits.map((h) => fieldValue(h, f, base)).filter((v) => v !== null && v !== "");
+        row[f.name] = vals.length ? vals.join("; ") : null;
+      } else row[f.name] = hits[0] ? fieldValue(hits[0], f, base) : null;
+    }
+    return row;
+  }).filter((r) => Object.values(r).some((v) => v !== null && v !== ""));
+}
+
+/* sitemap.xml: one row per <url> (or child sitemap) with its location and last change. */
+function sitemapRows(xml: string): Record<string, Cell>[] | null {
+  if (!/<(urlset|sitemapindex)[\s>]/i.test(xml)) return null;
+  const root = parse(xml);
+  return root.querySelectorAll("url, sitemap").slice(0, MAX_ROWS).map((u) => ({
+    url: text(u.querySelector("loc")), lastmod: text(u.querySelector("lastmod")) || null, priority: num(text(u.querySelector("priority"))),
+  })).filter((r) => r.url);
+}
+
+/* "page-[1-5].html", "?p=[0-100:20]" or "[001-010]" expands to a list of start URLs. */
+export function expandRange(raw: string, max = 20): string[] {
+  const m = raw.match(/\[(\d+)-(\d+)(?::(\d+))?\]/);
+  if (!m) return [raw];
+  const [whole, a, b, step] = m;
+  const from = Number(a), to = Number(b), by = Math.max(1, Number(step ?? 1));
+  if (to < from) throw new ScrapeError("In a URL range like [1-5], the first number must be the smaller one.");
+  const pad = a.length > 1 && a.startsWith("0") ? a.length : 0;
+  const out: string[] = [];
+  for (let n = from; n <= to && out.length < max; n += by) out.push(raw.replace(whole, String(n).padStart(pad, "0")));
+  return out;
+}
+
 /* The "next page" link of a paginated listing, if there is one. */
-export function nextLink(html: string, base: URL): URL | null {
+export function nextLink(html: string, base: URL, custom?: string): URL | null {
   const root = parse(html, { comment: false });
-  const rel = root.querySelector('link[rel="next"]') ?? root.querySelector('a[rel="next"]');
-  const candidates = rel ? [rel] : root.querySelectorAll("a[href]").filter((a) => {
+  const rel = custom ? selectAll(root, custom).map((el) => (el.tagName === "A" ? el : el.querySelector("a[href]") ?? el))[0]
+    : root.querySelector('link[rel="next"]') ?? root.querySelector('a[rel="next"]');
+  const candidates = rel ? [rel] : custom ? [] : root.querySelectorAll("a[href]").filter((a) => {
     const cls = `${a.getAttribute("class") ?? ""} ${(a.parentNode as HTMLElement | null)?.getAttribute?.("class") ?? ""}`;
     const label = `${text(a)} ${a.getAttribute("aria-label") ?? ""} ${a.getAttribute("title") ?? ""}`.trim();
     return /(^|\s)next(\s|$)/i.test(cls) || /^(next|next page|older|more)\b|^[›»→]$/i.test(label) || /\bnext\b/i.test(a.getAttribute("rel") ?? "");
@@ -375,11 +465,10 @@ function merge(all: Dataset[][]): Dataset[] {
 
 /* ----------------------------------------------------------------- api -- */
 
-export async function scrape(raw: string, opts: ScrapeOptions = {}): Promise<ScrapeResult> {
+async function scrapeOne(raw: string, opts: ScrapeOptions, started: number, maxPages: number): Promise<ScrapeResult> {
   let url: URL;
   if (/^[a-z][a-z0-9+.-]*:\/\//i.test(raw.trim()) && !/^https?:\/\//i.test(raw.trim())) throw new ScrapeError("Only http and https URLs are supported.");
   try { url = new URL(/^https?:\/\//i.test(raw.trim()) ? raw.trim() : `https://${raw.trim()}`); } catch { throw new ScrapeError("That doesn't look like a valid URL."); }
-  const started = Date.now();
   const mode = opts.mode ?? "auto";
   const allowPrivate = Boolean(opts.allowPrivate);
   const robots = mode === "json" ? "skipped" : await robotsAllows(url, allowPrivate);
@@ -396,25 +485,79 @@ export async function scrape(raw: string, opts: ScrapeOptions = {}): Promise<Scr
     const datasets = extractJson(data);
     return { ...base, pages: 1, kind: "json", ms: Date.now() - started, meta: { records: datasets[0]?.rows.length ?? 0 }, datasets };
   }
+  const urls = sitemapRows(body);
+  if (urls) return { ...base, pages: 1, kind: "html", ms: Date.now() - started, meta: { records: urls.length }, datasets: [toDataset("sitemap", `${urls.length} URLs from sitemap.xml`, urls)] };
   const selector = opts.selector?.trim() || undefined;
-  const first = extractHtml(body, finalUrl, selector);
+  const recipe = opts.recipe;
+  const first = extractHtml(body, finalUrl, selector, recipe);
   const pages = [first.datasets];
-  const maxPages = Math.min(10, Math.max(1, Math.floor(opts.pages ?? 1)));
   let bytes = body.length;
-  let next = maxPages > 1 ? nextLink(body, finalUrl) : null;
+  let next = maxPages > 1 ? nextLink(body, finalUrl, recipe?.next) : null;
   const visited = new Set([finalUrl.toString()]);
-  while (next && pages.length < maxPages && Date.now() - started < 20_000 && !visited.has(next.toString())) {
+  while (next && pages.length < maxPages && Date.now() - started < 18_000 && !visited.has(next.toString())) {
     visited.add(next.toString());
     try {
       const page = await get(next, allowPrivate, "text/html");
       const html = await readCapped(page.res);
       if (!page.res.ok) break;
       bytes += html.length;
-      pages.push(extractHtml(html, page.url, selector).datasets);
-      next = nextLink(html, page.url);
+      pages.push(extractHtml(html, page.url, selector, recipe).datasets);
+      next = nextLink(html, page.url, recipe?.next);
     } catch { break; }
   }
   return { ...base, bytes, pages: pages.length, kind: "html", ms: Date.now() - started, meta: first.meta, datasets: pages.length > 1 ? merge(pages) : first.datasets };
+}
+
+/* Open each item's link and add the detail page's fields to its row (Web Scraper's "link" selector). */
+async function followDetails(result: ScrapeResult, recipe: Recipe, allowPrivate: boolean, started: number) {
+  const follow = recipe.follow;
+  const ds = result.datasets.find((d) => d.name === "custom fields");
+  if (!follow || !ds || !follow.fields.length) return;
+  const queue = ds.rows.slice(0, follow.limit ?? 10).map((row) => ({ row, href: row[follow.field] }))
+    .filter((q): q is { row: Record<string, Cell>; href: string } => typeof q.href === "string" && /^https?:\/\//.test(q.href));
+  let opened = 0, failed = 0;
+  const worker = async () => {
+    for (let q = queue.shift(); q; q = queue.shift()) {
+      if (Date.now() - started > 24_000) { failed++; continue; }
+      try {
+        const url = new URL(q.href);
+        if ((await robotsAllows(url, allowPrivate)) === "disallowed") { failed++; continue; }
+        const page = await get(url, allowPrivate, "text/html");
+        const html = await readCapped(page.res);
+        if (!page.res.ok) { failed++; continue; }
+        const detail = recipeRows(parse(html, { comment: false, blockTextElements: { script: true, style: true } }), page.url, follow.fields)[0] ?? {};
+        Object.assign(q.row, detail);
+        result.bytes += html.length;
+        opened++;
+      } catch { failed++; }
+    }
+  };
+  await Promise.all([worker(), worker(), worker(), worker()]);
+  follow.fields.forEach((f) => { if (!ds.columns.includes(f.name)) ds.columns.push(f.name); });
+  result.meta = { ...result.meta, detail_pages: opened, detail_failed: failed };
+}
+
+export async function scrape(raw: string, opts: ScrapeOptions = {}): Promise<ScrapeResult> {
+  const started = Date.now();
+  const starts = expandRange(raw.trim());
+  const maxPages = Math.min(10, Math.max(1, Math.floor(opts.pages ?? 1)));
+  let result: ScrapeResult;
+  if (starts.length === 1) result = await scrapeOne(starts[0], opts, started, maxPages);
+  else {
+    // A URL range: scrape each start URL once (no next-page following) and stack the results.
+    const parts: ScrapeResult[] = [];
+    let lastError: unknown;
+    for (const u of starts) {
+      if (Date.now() - started > 18_000) break;
+      try { parts.push(await scrapeOne(u, opts, started, 1)); } catch (e) { lastError = e; }
+    }
+    if (!parts.length) throw lastError instanceof ScrapeError ? lastError : new ScrapeError("None of the URLs in that range could be scraped.", 502);
+    result = { ...parts[0], url: raw.trim(), pages: parts.length, bytes: parts.reduce((n, p) => n + p.bytes, 0), datasets: merge(parts.map((p) => p.datasets)) };
+    result.meta = { ...result.meta, range_urls: starts.length };
+  }
+  if (opts.recipe?.follow) await followDetails(result, opts.recipe, Boolean(opts.allowPrivate), started);
+  result.ms = Date.now() - started;
+  return result;
 }
 
 /* Per-instance rate limit: 20 requests a minute per client IP. */

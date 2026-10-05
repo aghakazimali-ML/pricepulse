@@ -1,13 +1,14 @@
-import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from "react";
+import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { motion, useReducedMotion } from "motion/react";
-import { Activity, BarChart3, Database, Download, Globe, History, LayoutGrid, Loader2, Package, Play, Radar, RefreshCw, Search, Trash2 } from "lucide-react";
+import { Activity, BarChart3, Clock, Database, Download, FileUp, Globe, History, LayoutGrid, Loader2, Package, Play, Plus, Radar, RefreshCw, Search, Trash2, X } from "lucide-react";
 import { AreaTrend, BarCompare, ChartCard, DonutBreakdown, KpiCard, type Series } from "@/components/ui/revenue-charts-kpi";
 import { cn } from "@/lib/utils";
 import type { Data, Product, Run } from "./types";
 import {
-  buildData, currencyOf, failedSnapshot, labelFor, loadSources, primaryDataset, saveSources, snapshotFrom, sourceId,
-  type Cell, type LiveSource, type ScrapeResult,
+  applyParsers, buildData, currencyOf, failedSnapshot, labelFor, loadSources, PARSER_OPS, primaryDataset, saveSources, snapshotFrom, sourceId,
+  type Cell, type FieldSpec, type FieldType, type LiveSource, type Parser, type ParserOp, type Recipe, type ScrapeResult,
 } from "./workspace";
+import { xlsx } from "./xlsx";
 
 const REPO = "https://github.com/aghakazimali-ML/pricepulse";
 const DEMO = "demo";
@@ -46,8 +47,14 @@ interface Workspace {
   sources: LiveSource[];
   active: string;
   setActive: (id: string) => void;
-  scrape: (req: { url: string; mode: string; selector: string; pages: number }) => Promise<{ result?: ScrapeResult; error?: string; source?: LiveSource }>;
+  scrape: (req: ScrapeRequest) => Promise<{ result?: ScrapeResult; error?: string; source?: LiveSource }>;
   remove: (id: string) => void;
+  update: (id: string, patch: Partial<LiveSource>) => void;
+}
+interface ScrapeRequest {
+  url: string; mode: string; selector: string; pages: number;
+  recipe?: Recipe | null; parsers?: Parser[]; every?: number;
+  background?: boolean; // scheduled runs don't switch the dashboard to the source
 }
 const Ctx = createContext<Workspace>(null!);
 const useWorkspace = () => useContext(Ctx);
@@ -685,21 +692,89 @@ function Health({ d }: { d: Data }) {
 
 /* -------------------------------------------------------------- scrape -- */
 
-const PRESETS = [
+const BOOK_DETAIL_RECIPE: Recipe = {
+  item: "article.product_pod",
+  fields: [
+    { name: "title", selector: "h3 a", type: "attr", attr: "title" },
+    { name: "price", selector: ".price_color", type: "number" },
+    { name: "availability", selector: ".availability", type: "text" },
+    { name: "link", selector: "h3 a", type: "link" },
+    { name: "image", selector: "img", type: "image" },
+  ],
+  next: "li.next a",
+  follow: { field: "link", limit: 10, fields: [
+    { name: "category", selector: ".breadcrumb li:nth-child(3)", type: "text" },
+    { name: "upc", selector: "table tr td", type: "text" },
+    { name: "description", selector: "#product_description + p", type: "text" },
+  ] },
+};
+
+const PRESETS: (ScrapeRequest & { label: string })[] = [
   { label: "Books to Scrape (5 pages)", url: "https://books.toscrape.com/", mode: "auto", selector: "", pages: 5 },
+  { label: "Books with detail pages (custom fields)", url: "https://books.toscrape.com/", mode: "html", selector: "", pages: 1, recipe: BOOK_DETAIL_RECIPE },
+  { label: "Page range [1-3]", url: "https://books.toscrape.com/catalogue/page-[1-3].html", mode: "html", selector: "", pages: 1 },
   { label: "Quotes (CSS selector)", url: "https://quotes.toscrape.com/", mode: "html", selector: ".quote", pages: 3 },
   { label: "JSON API: products", url: "https://dummyjson.com/products?limit=100", mode: "json", selector: "", pages: 1 },
   { label: "JSON API: users", url: "https://jsonplaceholder.typicode.com/users", mode: "json", selector: "", pages: 1 },
 ];
+
+const FIELD_TYPES: [FieldType, string][] = [["text", "Text"], ["number", "Number"], ["link", "Link URL"], ["image", "Image URL"], ["attr", "Attribute"], ["html", "HTML"]];
+const SCHEDULES: [number, string][] = [[0, "Off"], [5, "Every 5 min"], [15, "Every 15 min"], [30, "Every 30 min"], [60, "Every hour"], [360, "Every 6 hours"]];
+const blankField = (): FieldSpec => ({ name: "", selector: "", type: "text" });
+const smallInput = cn(inputCls, "h-8 min-w-0 text-[12.5px]");
+
+/* Rows of named fields: CSS selector, what to read from it, and whether to keep every match. */
+function FieldRows({ fields, onChange, label }: { fields: FieldSpec[]; onChange: (f: FieldSpec[]) => void; label: string }) {
+  const set = (i: number, patch: Partial<FieldSpec>) => onChange(fields.map((f, j) => (j === i ? { ...f, ...patch } : f)));
+  return (
+    <div className="grid gap-2">
+      {fields.map((f, i) => (
+        <div key={i} className="grid grid-cols-2 items-center gap-2 sm:grid-cols-[140px_1fr_120px_110px_auto_auto]">
+          <input aria-label={`${label} ${i + 1} name`} className={smallInput} placeholder="Column name" value={f.name} onChange={(e) => set(i, { name: e.target.value })} />
+          <input aria-label={`${label} ${i + 1} selector`} className={cn(smallInput, "font-mono")} placeholder="CSS selector, e.g. h3 a" value={f.selector} onChange={(e) => set(i, { selector: e.target.value })} />
+          <select aria-label={`${label} ${i + 1} type`} className={smallInput} value={f.type} onChange={(e) => set(i, { type: e.target.value as FieldType })}>
+            {FIELD_TYPES.map(([v, l]) => <option key={v} value={v}>{l}</option>)}
+          </select>
+          {f.type === "attr"
+            ? <input aria-label={`${label} ${i + 1} attribute`} className={cn(smallInput, "font-mono")} placeholder="attribute" value={f.attr ?? ""} onChange={(e) => set(i, { attr: e.target.value })} />
+            : <span className="hidden sm:block" />}
+          <label className="flex items-center gap-1.5 text-[12px] text-muted-foreground">
+            <input type="checkbox" checked={Boolean(f.multiple)} onChange={(e) => set(i, { multiple: e.target.checked })} /> All matches
+          </label>
+          <button type="button" aria-label={`Remove ${label.toLowerCase()} ${i + 1}`} className={btnCls} onClick={() => onChange(fields.filter((_, j) => j !== i))}><X className="size-3.5" aria-hidden /></button>
+        </div>
+      ))}
+      <div><button type="button" className={btnCls} onClick={() => onChange([...fields, blankField()])}><Plus className="size-3.5" aria-hidden /> Add field</button></div>
+    </div>
+  );
+}
+
+function Section({ title, hint, badge, children }: { title: string; hint: string; badge?: string; children: ReactNode }) {
+  return (
+    <details className="group rounded-[14px] bg-background/40 ring-1 ring-border">
+      <summary className="flex cursor-pointer list-none items-center justify-between gap-3 px-4 py-3 [&::-webkit-details-marker]:hidden">
+        <span className="grid gap-0.5">
+          <span className="text-[13px] font-medium text-foreground">{title}</span>
+          <span className="text-[12px] text-muted-foreground">{hint}</span>
+        </span>
+        <span className="flex items-center gap-2">
+          {badge && <span className="rounded-full bg-muted px-2 py-0.5 text-[11.5px] text-foreground ring-1 ring-border">{badge}</span>}
+          <Plus className="size-4 text-muted-foreground transition-transform group-open:rotate-45" aria-hidden />
+        </span>
+      </summary>
+      <div className="grid gap-3 border-t border-border px-4 py-4">{children}</div>
+    </details>
+  );
+}
 
 const csvCell = (v: Cell | undefined) => {
   const s = v === null || v === undefined ? "" : String(v);
   return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
 };
 
-function download(name: string, body: string, type: string) {
+function download(name: string, body: string | Blob, type = "") {
   const a = document.createElement("a");
-  a.href = URL.createObjectURL(new Blob([body], { type }));
+  a.href = URL.createObjectURL(typeof body === "string" ? new Blob([body], { type }) : body);
   a.download = name;
   a.click();
   setTimeout(() => URL.revokeObjectURL(a.href), 1000);
@@ -716,8 +791,47 @@ function Scrape(_: { d?: Data | null }) {
   const [result, setResult] = useState<ScrapeResult | null>(null);
   const [saved, setSaved] = useState<LiveSource | null>(null);
   const [tab, setTab] = useState(0);
+  // Custom fields (a Web Scraper-style sitemap), clean-up steps and schedule.
+  const [useFields, setUseFields] = useState(false);
+  const [item, setItem] = useState("");
+  const [fields, setFields] = useState<FieldSpec[]>([blankField()]);
+  const [next, setNext] = useState("");
+  const [followOn, setFollowOn] = useState(false);
+  const [followField, setFollowField] = useState("");
+  const [followFields, setFollowFields] = useState<FieldSpec[]>([blankField()]);
+  const [followLimit, setFollowLimit] = useState(10);
+  const [parsers, setParsers] = useState<Parser[]>([]);
+  const [every, setEvery] = useState(0);
+  const fileRef = useRef<HTMLInputElement>(null);
 
-  async function run(req = { url, mode, selector, pages }) {
+  const named = (fs: FieldSpec[]) => fs.filter((f) => f.name.trim()).map((f) => ({ ...f, name: f.name.trim(), selector: f.selector.trim() }));
+  const linkFields = named(fields).filter((f) => f.type === "link" || f.type === "attr");
+  const recipe: Recipe | null = useFields && named(fields).length ? {
+    item: item.trim() || undefined, fields: named(fields), next: next.trim() || undefined,
+    follow: followOn && followField && named(followFields).length ? { field: followField, fields: named(followFields), limit: followLimit } : undefined,
+  } : null;
+  const steps = parsers.filter((p) => p.column.trim());
+
+  function loadRecipe(r: Recipe | null | undefined) {
+    setUseFields(Boolean(r));
+    if (!r) return;
+    setItem(r.item ?? ""); setFields(r.fields.length ? r.fields : [blankField()]); setNext(r.next ?? "");
+    setFollowOn(Boolean(r.follow)); setFollowField(r.follow?.field ?? ""); setFollowFields(r.follow?.fields.length ? r.follow.fields : [blankField()]); setFollowLimit(r.follow?.limit ?? 10);
+  }
+
+  async function importRecipe(file: File) {
+    try {
+      const j = JSON.parse(await file.text());
+      const r: Recipe | undefined = j.recipe ?? (Array.isArray(j.fields) ? j : undefined);
+      if (j.url) setUrl(j.url);
+      if (Array.isArray(j.parsers)) setParsers(j.parsers);
+      if (typeof j.every === "number") setEvery(j.every);
+      if (r) loadRecipe(r);
+      setError(null);
+    } catch { setError("That file is not a PricePulse recipe (JSON)."); }
+  }
+
+  async function run(req: ScrapeRequest = { url, mode, selector, pages, recipe, parsers: steps, every }) {
     if (!req.url.trim()) return;
     setBusy(true); setError(null);
     const out = await ws.scrape(req);
@@ -747,7 +861,7 @@ function Scrape(_: { d?: Data | null }) {
               <span className="sr-only">URL to scrape</span>
               <Globe className="pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2 text-muted-foreground" aria-hidden />
               <input className={cn(inputCls, "h-11 w-full pl-9 text-[14px]")} type="text" inputMode="url"
-                placeholder="https://example.com/products or https://api.example.com/items" value={url} onChange={(e) => setUrl(e.target.value)} />
+                placeholder="https://example.com/products, a JSON API, a sitemap.xml, or a range like /page-[1-5]" value={url} onChange={(e) => setUrl(e.target.value)} />
             </label>
             <label>
               <span className="sr-only">Source type</span>
@@ -777,12 +891,92 @@ function Scrape(_: { d?: Data | null }) {
             <span className="text-[12px] text-muted-foreground">Try:</span>
             {PRESETS.map((p) => (
               <button key={p.label} type="button" disabled={busy}
-                onClick={() => { setUrl(p.url); setMode(p.mode); setSelector(p.selector); setPages(p.pages); run(p); }}
+                onClick={() => { setUrl(p.url); setMode(p.mode); setSelector(p.selector); setPages(p.pages); loadRecipe(p.recipe); run({ ...p, parsers: steps, every }); }}
                 className="cursor-pointer rounded-full border-0 bg-muted px-2.5 py-1 text-[12px] text-foreground ring-1 ring-border hover:bg-accent disabled:cursor-wait">
                 {p.label}
               </button>
             ))}
           </div>
+          <p className="m-0 text-[12px] text-muted-foreground">
+            Tip: put a range like <code>[1-5]</code> in the URL to scrape several pages at once, or paste a <code>sitemap.xml</code> to list a site's pages.
+          </p>
+
+          <Section title="Custom fields" hint="Pick exactly what to extract with CSS selectors, like a Web Scraper sitemap." badge={recipe ? `${recipe.fields.length} field${recipe.fields.length === 1 ? "" : "s"}${recipe.follow ? " + detail pages" : ""}` : undefined}>
+            <label className="flex items-center gap-2 text-[13px]">
+              <input type="checkbox" checked={useFields} onChange={(e) => setUseFields(e.target.checked)} /> Use these fields when scraping
+            </label>
+            <div className="grid gap-2 sm:grid-cols-2">
+              <label className="grid gap-1 text-[12px] text-muted-foreground">Item selector (one per record)
+                <input className={cn(smallInput, "font-mono")} placeholder="e.g. article.product_pod (blank = whole page)" value={item} onChange={(e) => setItem(e.target.value)} />
+              </label>
+              <label className="grid gap-1 text-[12px] text-muted-foreground">Next-page selector (optional)
+                <input className={cn(smallInput, "font-mono")} placeholder="e.g. li.next a (blank = detect)" value={next} onChange={(e) => setNext(e.target.value)} />
+              </label>
+            </div>
+            <p className="m-0 text-[12px] text-muted-foreground">Fields are looked up inside each item. Leave a selector blank to read the item itself.</p>
+            <FieldRows label="Field" fields={fields} onChange={setFields} />
+            <div className="grid gap-2 rounded-[12px] p-3 ring-1 ring-border">
+              <label className="flex items-center gap-2 text-[13px]">
+                <input type="checkbox" checked={followOn} onChange={(e) => setFollowOn(e.target.checked)} /> Open each item's link and read its detail page
+              </label>
+              {followOn && (
+                <>
+                  <div className="flex flex-wrap items-center gap-2 text-[12px] text-muted-foreground">
+                    Link field
+                    <select className={smallInput} value={followField} onChange={(e) => setFollowField(e.target.value)}>
+                      <option value="">Choose a Link URL field</option>
+                      {linkFields.map((f) => <option key={f.name} value={f.name}>{f.name}</option>)}
+                    </select>
+                    for the first
+                    <select className={smallInput} value={followLimit} onChange={(e) => setFollowLimit(Number(e.target.value))}>
+                      {[5, 10, 25].map((n) => <option key={n} value={n}>{n} items</option>)}
+                    </select>
+                  </div>
+                  <FieldRows label="Detail field" fields={followFields} onChange={setFollowFields} />
+                </>
+              )}
+            </div>
+            <div className="flex flex-wrap gap-2">
+              <button type="button" className={btnCls} onClick={() => download("pricepulse-recipe.json", JSON.stringify({ url, recipe, parsers: steps, every }, null, 2), "application/json")}>
+                <Download className="size-3.5" aria-hidden /> Export recipe
+              </button>
+              <button type="button" className={btnCls} onClick={() => fileRef.current?.click()}><FileUp className="size-3.5" aria-hidden /> Import recipe</button>
+              <input ref={fileRef} type="file" accept="application/json,.json" hidden onChange={(e) => { const f = e.target.files?.[0]; if (f) importRecipe(f); e.target.value = ""; }} />
+            </div>
+          </Section>
+
+          <Section title="Clean up data" hint="Fix values before they reach the dashboard: replace text, regex, rename or drop columns." badge={steps.length ? `${steps.length} step${steps.length === 1 ? "" : "s"}` : undefined}>
+            <datalist id="pp-columns">
+              {[...new Set([...(result ? primaryDataset(result)?.columns ?? [] : []), ...named(fields).map((f) => f.name), ...named(followFields).map((f) => f.name)])].map((c) => <option key={c} value={c} />)}
+            </datalist>
+            {parsers.map((p, i) => {
+              const def = PARSER_OPS.find((o) => o.op === p.op)!;
+              const set = (patch: Partial<Parser>) => setParsers(parsers.map((x, j) => (j === i ? { ...x, ...patch } : x)));
+              return (
+                <div key={i} className="grid grid-cols-2 items-center gap-2 sm:grid-cols-[160px_170px_1fr_1fr_auto]">
+                  <input aria-label={`Step ${i + 1} column`} list="pp-columns" className={smallInput} placeholder="Column" value={p.column} onChange={(e) => set({ column: e.target.value })} />
+                  <select aria-label={`Step ${i + 1} action`} className={smallInput} value={p.op} onChange={(e) => set({ op: e.target.value as ParserOp })}>
+                    {PARSER_OPS.map((o) => <option key={o.op} value={o.op}>{o.label}</option>)}
+                  </select>
+                  {def.a ? <input aria-label={def.a} className={cn(smallInput, "font-mono")} placeholder={def.a} value={p.a ?? ""} onChange={(e) => set({ a: e.target.value })} /> : <span className="hidden sm:block" />}
+                  {def.b ? <input aria-label={def.b} className={cn(smallInput, "font-mono")} placeholder={def.b} value={p.b ?? ""} onChange={(e) => set({ b: e.target.value })} /> : <span className="hidden sm:block" />}
+                  <button type="button" aria-label={`Remove step ${i + 1}`} className={btnCls} onClick={() => setParsers(parsers.filter((_, j) => j !== i))}><X className="size-3.5" aria-hidden /></button>
+                </div>
+              );
+            })}
+            <div><button type="button" className={btnCls} onClick={() => setParsers([...parsers, { column: "", op: "whitespace" }])}><Plus className="size-3.5" aria-hidden /> Add step</button></div>
+            <p className="m-0 text-[12px] text-muted-foreground">Steps run in order on every scrape of this source, including scheduled ones.</p>
+          </Section>
+
+          <Section title="Schedule" hint="Re-scrape this source automatically to build price history." badge={every ? SCHEDULES.find(([m]) => m === every)?.[1] : undefined}>
+            <label className="flex flex-wrap items-center gap-2 text-[13px]">
+              <Clock className="size-4 text-muted-foreground" aria-hidden /> Run
+              <select className={smallInput} value={every} onChange={(e) => setEvery(Number(e.target.value))}>
+                {SCHEDULES.map(([m, l]) => <option key={m} value={m}>{l}</option>)}
+              </select>
+            </label>
+            <p className="m-0 text-[12px] text-muted-foreground">Scheduled runs happen while PricePulse is open in a browser tab, and each one is logged in Pipeline Health. You can change it later in Your sources.</p>
+          </Section>
         </form>
       </Reveal>
 
@@ -801,7 +995,7 @@ function Scrape(_: { d?: Data | null }) {
           <div className={cn("flex flex-wrap items-center justify-between gap-3 rounded-[14px] px-4 py-3 ring-1", loaded.ok ? "bg-emerald-500/10 ring-emerald-500/30" : "bg-amber-500/10 ring-amber-500/30")}>
             <p className="m-0 text-[13px] text-foreground">
               {loaded.ok
-                ? <>Loaded <b>{int(loaded.items.length)}</b> clean records from <b>{saved.label}</b>{loaded.pages > 1 ? ` across ${loaded.pages} pages` : ""}{loaded.rejected.length ? `, ${loaded.rejected.length} rejected` : ""}. The whole dashboard now shows this source.</>
+                ? <>Loaded <b>{int(loaded.items.length)}</b> clean records from <b>{saved.label}</b>{loaded.pages > 1 ? ` across ${loaded.pages} pages` : ""}{result.meta?.detail_pages ? ` and ${result.meta.detail_pages} detail pages` : ""}{loaded.rejected.length ? `, ${loaded.rejected.length} rejected` : ""}. The whole dashboard now shows this source.</>
                 : result.meta?.needs_js
                   ? <>The site answered, but it builds its content with JavaScript in the browser, so the HTML PricePulse receives has no records. The dashboard is unchanged. Try the site's own JSON API instead (in Chrome: Inspect, Network, Fetch/XHR, then copy a JSON URL and paste it here).</>
                   : <>The site answered, but PricePulse couldn't spot a list of repeated items, tables or records on it, so the dashboard is unchanged. Tell it which element is one item: right-click an item, choose Inspect, copy its class (for example <code>.product-card</code>) into the CSS selector box and scrape again.</>}
@@ -822,7 +1016,7 @@ function Scrape(_: { d?: Data | null }) {
           <Kpis
             key={result.finalUrl + result.ms}
             cards={[
-              { label: "HTTP status", value: String(result.status), period: result.kind === "json" ? "JSON API" : `HTML, ${result.pages} page${result.pages === 1 ? "" : "s"}` },
+              { label: "HTTP status", value: String(result.status), period: result.kind === "json" ? "JSON API" : `HTML, ${result.pages} page${result.pages === 1 ? "" : "s"}${result.meta?.detail_pages ? ` + ${result.meta.detail_pages} detail` : ""}` },
               { label: "Records found", value: int(total), period: `${result.datasets.length} datasets` },
               { label: "Fetch and parse", value: `${(result.ms / 1000).toFixed(2)}s`, period: `${(result.bytes / 1024).toFixed(0)} KB` },
               { label: "robots.txt", value: result.robots === "allowed" ? "Allowed" : result.robots === "skipped" ? "Skipped" : "None found", period: result.robots === "skipped" ? "APIs are not checked" : "checked before fetching" },
@@ -838,6 +1032,9 @@ function Scrape(_: { d?: Data | null }) {
                 </button>
                 <button type="button" className={btnCls} onClick={() => download(`${slug}-${ds.name.replace(/\W+/g, "-")}.json`, JSON.stringify(ds.rows, null, 2), "application/json")}>
                   <Download className="size-3.5" aria-hidden /> JSON
+                </button>
+                <button type="button" className={btnCls} onClick={() => download(`${slug}-${ds.name.replace(/\W+/g, "-")}.xlsx`, xlsx(ds.columns, ds.rows))}>
+                  <Download className="size-3.5" aria-hidden /> Excel
                 </button>
               </div>
             }
@@ -864,9 +1061,9 @@ function Scrape(_: { d?: Data | null }) {
         <Reveal delay={0.08}>
           <div className="grid gap-3 sm:grid-cols-3">
             {[
-              ["Websites", "Finds repeated product cards (title, price, rating, stock, link, image), schema.org data and HTML tables, and follows next-page links."],
+              ["Websites", "Finds repeated items, schema.org data and tables on its own, follows next-page links and URL ranges, or uses your custom fields and opens detail pages."],
               ["JSON APIs", "Finds the biggest list of records in the response and flattens nested fields into columns."],
-              ["Runs like the pipeline", "Each scrape is validated, quality-checked and logged as a run. Scrape the same source again to build price history."],
+              ["Runs like the pipeline", "Each scrape is cleaned, validated and logged as a run. Schedule a source to build price history, and export CSV, JSON or Excel."],
             ].map(([t, x]) => (
               <div key={t} className="grid gap-1 rounded-[14px] bg-card p-4 ring-1 ring-border">
                 <p className="m-0 text-[13px] font-medium">{t}</p>
@@ -892,6 +1089,13 @@ function Sources() {
           { key: "label", label: "Source", render: (s) => <span className={cn(s.id === ws.active && "font-medium")}>{s.label}{s.id === ws.active ? " · showing" : ""}</span> },
           { key: "runs", label: "Runs", align: "right", render: (s) => s.snapshots.length },
           { key: "records", label: "Records", align: "right", render: (s) => int([...s.snapshots].reverse().find((x) => x.ok)?.items.length ?? 0) },
+          {
+            key: "every", label: "Schedule", render: (s) => (
+              <select aria-label={`Schedule for ${s.label}`} className={smallInput} value={s.every ?? 0} onChange={(e) => ws.update(s.id, { every: Number(e.target.value) })}>
+                {SCHEDULES.map(([m, l]) => <option key={m} value={m}>{l}</option>)}
+              </select>
+            ),
+          },
           { key: "last", label: "Last run", align: "right", render: (s) => <span className="text-muted-foreground">{s.snapshots.length ? clock(s.snapshots.at(-1)!.at) : "–"}</span> },
           {
             key: "actions", label: "", align: "right", render: (s) => (
@@ -959,30 +1163,53 @@ export default function App() {
   const scrape = useCallback<Workspace["scrape"]>(async (req) => {
     const qs = new URLSearchParams({ url: req.url.trim(), mode: req.mode, pages: String(req.pages || 1) });
     if (req.selector?.trim()) qs.set("selector", req.selector.trim());
+    if (req.recipe) qs.set("recipe", JSON.stringify(req.recipe));
     let result: ScrapeResult | undefined;
     let error: string | undefined;
     try {
       const res = await fetch(`/api/scrape?${qs}`);
       const body = await res.json().catch(() => ({ error: `The scraper answered with HTTP ${res.status}.` }));
       if (!res.ok) throw new Error(body.error ?? `HTTP ${res.status}`);
-      result = body;
+      result = { ...body, datasets: (body as ScrapeResult).datasets.map((d) => applyParsers(d, req.parsers)) };
     } catch (e) {
       error = e instanceof Error ? e.message : String(e);
     }
     const key = result ? result.finalUrl : req.url.trim();
-    const id = sourceId(/^https?:\/\//i.test(key) ? key : `https://${key}`, req.selector?.trim() ?? "");
+    const id = sourceId(/^https?:\/\//i.test(key) ? key : `https://${key}`, req.selector?.trim() ?? "", req.recipe);
     const current = loadSources();
     const existing = current.find((s) => s.id === id);
     if (!result && !existing) return { error };
     const snap = result ? snapshotFrom(result) : failedSnapshot(error!);
     const primary = result ? primaryDataset(result) : undefined;
+    const settings = { recipe: req.recipe ?? null, parsers: req.parsers ?? [], every: req.every ?? existing?.every ?? 0 };
+    // A URL range keeps the pattern as the source URL, so "Scrape again" re-runs the whole range.
+    const srcUrl = /\[\d+-\d+(:\d+)?\]/.test(req.url) ? req.url.trim() : result?.finalUrl ?? req.url.trim();
     const src: LiveSource = existing
-      ? { ...existing, currency: existing.currency || (primary ? currencyOf(primary) : ""), snapshots: [...existing.snapshots, snap] }
-      : { id, url: result!.finalUrl, label: labelFor(result!.finalUrl) + (req.selector?.trim() ? ` (${req.selector.trim()})` : ""), mode: req.mode, selector: req.selector?.trim() ?? "", pages: req.pages || 1, currency: primary ? currencyOf(primary) : "", snapshots: [snap] };
-    commit([src, ...current.filter((s) => s.id !== id)]);
-    if (snap.ok) setActive(id);
+      ? { ...existing, ...settings, currency: existing.currency || (primary ? currencyOf(primary) : ""), snapshots: [...existing.snapshots, snap] }
+      : { id, url: srcUrl, label: labelFor(srcUrl) + (req.selector?.trim() ? ` (${req.selector.trim()})` : "") + (req.recipe ? " (custom fields)" : ""), mode: req.mode, selector: req.selector?.trim() ?? "", pages: req.pages || 1, currency: primary ? currencyOf(primary) : "", snapshots: [snap], ...settings };
+    const latest = loadSources();
+    commit([src, ...latest.filter((s) => s.id !== id)]);
+    if (snap.ok && !req.background) setActive(id);
     return { result, error, source: src };
   }, [commit, setActive]);
+
+  const update = useCallback((id: string, patch: Partial<LiveSource>) => {
+    commit(loadSources().map((s) => (s.id === id ? { ...s, ...patch } : s)));
+  }, [commit]);
+
+  // Scheduler: re-scrape sources that are due, while this tab is open.
+  const running = useRef(new Set<string>());
+  useEffect(() => {
+    const t = setInterval(() => {
+      for (const s of loadSources()) {
+        const last = s.snapshots.at(-1);
+        if (!s.every || running.current.has(s.id) || (last && Date.now() - new Date(last.at).getTime() < s.every * 60_000)) continue;
+        running.current.add(s.id);
+        scrape({ ...s, background: true }).finally(() => running.current.delete(s.id));
+      }
+    }, 15_000);
+    return () => clearInterval(t);
+  }, [scrape]);
 
   const remove = useCallback((id: string) => {
     commit(loadSources().filter((s) => s.id !== id));
@@ -995,7 +1222,7 @@ export default function App() {
 
   const current = PAGES.find((p) => p.id === page)!;
   const View = current.view;
-  const ws: Workspace = { sources, active, setActive, scrape, remove };
+  const ws: Workspace = { sources, active, setActive, scrape, remove, update };
 
   return (
     <Ctx.Provider value={ws}>

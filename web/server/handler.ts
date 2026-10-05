@@ -1,7 +1,7 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
-import { rateLimited, scrape, ScrapeError, type ScrapeOptions } from "./scrape";
+import { parseRecipe, rateLimited, scrape, ScrapeError, type ScrapeOptions } from "./scrape";
 
-/* Node handler for /api/scrape?url=...&mode=auto|html|json&selector=... (Vercel function and Vite dev server). */
+/* Node handler for /api/scrape?url=...&mode=auto|html|json&selector=...&pages=N&recipe={json} (Vercel function and Vite dev server). */
 export default async function handler(req: IncomingMessage, res: ServerResponse) {
   const send = (status: number, body: unknown) => {
     res.statusCode = status;
@@ -17,7 +17,8 @@ export default async function handler(req: IncomingMessage, res: ServerResponse)
   if (rateLimited(ip)) return send(429, { error: "Too many requests. Try again in a minute." });
   const mode = (["auto", "html", "json"].includes(params.get("mode") ?? "") ? params.get("mode") : "auto") as ScrapeOptions["mode"];
   try {
-    send(200, await scrape(url, { mode, selector: params.get("selector") ?? undefined, pages: Number(params.get("pages") ?? 1) || 1, allowPrivate: process.env.SCRAPE_ALLOW_PRIVATE === "1" }));
+    const recipe = parseRecipe(params.get("recipe"));
+    send(200, await scrape(url, { mode, recipe, selector: params.get("selector") ?? undefined, pages: Number(params.get("pages") ?? 1) || 1, allowPrivate: process.env.SCRAPE_ALLOW_PRIVATE === "1" }));
   } catch (e) {
     const err = e instanceof ScrapeError ? e : new ScrapeError("Something went wrong while scraping.", 500);
     if (!(e instanceof ScrapeError)) console.error(e);
